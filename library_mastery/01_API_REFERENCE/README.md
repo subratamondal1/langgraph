@@ -19,7 +19,17 @@ Each top-level folder maps to a numbered section in the reference (Sections **1�
 - `13_prebuilt_tooling/` — Prebuilt Tooling
 - `14_serde_encryption/` — Serialization & Encryption
 
-## Run
+## Start With The Cookbooks
+
+Each section folder contains a `00_cookbook.py` “production-first” tour you can run in order:
+
+```bash
+./.venv/bin/python library_mastery/01_API_REFERENCE/01_core_entry_points/00_cookbook.py
+./.venv/bin/python library_mastery/01_API_REFERENCE/02_graph_construction/00_cookbook.py
+# ...
+```
+
+## Run Any Example
 
 Use the repo virtualenv (recommended):
 

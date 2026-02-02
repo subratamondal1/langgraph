@@ -4,6 +4,8 @@ This document is a **source-derived** reference for the **Python `langgraph` nam
 
 > Scope note: this file focuses on the **Python library surface** (`langgraph.*`). The CLI (`langgraph-cli`) and the server SDK (`langgraph-sdk`) are companion projects and are only referenced when the core library depends on them (e.g., `RemoteGraph`).
 
+Hands-on companion: runnable examples live in `library_mastery/01_API_REFERENCE/` (start with `01_core_entry_points/00_cookbook.py`, then follow the numbered folders).
+
 ## 0. Package Topology (Namespace Packaging)
 
 `langgraph` is a **PEP 420 namespace package** in this repo: there is no `langgraph/__init__.py`. The namespace is composed from multiple distributions under `libs/`:
@@ -1196,4 +1198,3 @@ Factory:
 ### `langgraph.utils.*` (**legacy; to be removed in v1**)
 **Source Files:** `libs/langgraph/langgraph/utils/config.py`, `libs/langgraph/langgraph/utils/runnable.py`
 **Description:** Back-compat reexports of internal helpers (`ensure_config`, `patch_configurable`, `RunnableCallable`, etc.).
-
