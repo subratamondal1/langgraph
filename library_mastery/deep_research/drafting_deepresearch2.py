@@ -873,85 +873,221 @@ class LLMEngine:
         This is intentionally basic; real behavior happens with the LLM.
         """
 
-        def parse_json_list(after_marker: str) -> list[str]:
+        def extract_json_block(after_marker: str, open_ch: str, close_ch: str) -> str | None:
             if after_marker not in user:
-                return []
+                return None
             tail = user.split(after_marker, 1)[1]
-            # Grab first JSON list in the tail
-            start = tail.find("[")
-            end = tail.find("]")
-            if start == -1 or end == -1 or end < start:
+            start = tail.find(open_ch)
+            if start == -1:
+                return None
+            depth = 0
+            for i in range(start, len(tail)):
+                ch = tail[i]
+                if ch == open_ch:
+                    depth += 1
+                elif ch == close_ch:
+                    depth -= 1
+                    if depth == 0:
+                        return tail[start : i + 1]
+            return None
+
+        def parse_json_list(after_marker: str) -> list[Any]:
+            block = extract_json_block(after_marker, "[", "]")
+            if not block:
                 return []
             try:
-                return json.loads(tail[start : end + 1])
+                val = json.loads(block)
             except Exception:
                 return []
+            return val if isinstance(val, list) else []
+
+        def parse_json_object(after_marker: str) -> dict[str, Any]:
+            block = extract_json_block(after_marker, "{", "}")
+            if not block:
+                return {}
+            try:
+                val = json.loads(block)
+            except Exception:
+                return {}
+            return val if isinstance(val, dict) else {}
 
         def parse_user_answer() -> str:
             if "User answer:" not in user:
                 return ""
             return user.split("User answer:", 1)[1].strip()
 
-        if schema is IntakeBatchOut:
-            missing_desc = parse_json_list("Missing keys for this batch:")
+        if schema is QuestionBatchOut:
+            expected = parse_json_list("expected_keys (ask ONLY these keys):") or parse_json_list("expected_keys:")
+            expected_keys = [str(x) for x in expected if isinstance(x, (str, int, float))]
             questions: list[Question] = []
-            for item in missing_desc:
-                key = item.split(" — ", 1)[0].strip()
-                questions.append(Question(key=key, question=f"Provide {key}.", required=True, example=None))
-            return IntakeBatchOut(
+            for key in expected_keys:
+                if key == "proceed_with_blanks":
+                    questions.append(
+                        Question(
+                            key=key,
+                            question="If you want to proceed with placeholders for missing required items, answer yes/no.",
+                            required=False,
+                            category="assumption",
+                            priority=1,
+                            example="no",
+                        )
+                    )
+                else:
+                    questions.append(
+                        Question(
+                            key=key,
+                            question=f"Provide {key}.",
+                            required=True,
+                            category="blocker",
+                            priority=1,
+                            example=None,
+                        )
+                    )
+            return QuestionBatchOut(
                 batch_name="Mock intake batch",
                 questions=questions,
-                answer_format="Answer as key: value lines (end with blank line).",
+                expected_keys=expected_keys,
+                answer_format="Answer as key: value lines (end with blank line). If unknown, write [UNKNOWN].",
             )
 
         if schema is IntakeExtractOut:
-            expected = parse_json_list("Expected keys (extract only these keys if present):")
+            expected_any = parse_json_list("Expected keys (extract only these keys if present):")
+            expected = [str(x) for x in expected_any if isinstance(x, (str, int, float))]
             answer_text = parse_user_answer()
 
             updates: dict[str, str] = {}
-            blanks: list[str] = []
+            explicitly_unknown: list[str] = []
+            proceed_with_blanks: Optional[bool] = None
 
-            if len(expected) == 1:
-                # Freeform answer goes into the single expected key.
-                updates[expected[0]] = answer_text
-            else:
-                # Parse key:value lines, keep only expected keys.
-                for line in answer_text.splitlines():
-                    if ":" not in line:
-                        continue
-                    k, v = line.split(":", 1)
-                    k = k.strip()
-                    v = v.strip()
-                    if k in expected:
-                        updates[k] = v
-                        if v.lower() in {"blank", "unknown", "[blank]"}:
-                            blanks.append(k)
+            # Parse key:value lines, keep only expected keys.
+            for line in answer_text.splitlines():
+                if ":" not in line:
+                    continue
+                k, v = line.split(":", 1)
+                k = k.strip()
+                v = v.strip()
+                if k not in expected:
+                    continue
+                if k == "proceed_with_blanks":
+                    vv = v.lower()
+                    if vv in {"y", "yes", "true", "1"}:
+                        proceed_with_blanks = True
+                    elif vv in {"n", "no", "false", "0"}:
+                        proceed_with_blanks = False
+                    continue
+                updates[k] = v
+                if v.lower() in {"blank", "unknown", "[blank]", "[unknown]"}:
+                    explicitly_unknown.append(k)
 
             understood = "(mock) extracted: " + ", ".join(sorted(list(updates.keys())))
             still_missing = [k for k in expected if k not in updates]
             return IntakeExtractOut(
-                updates=updates, blanks=blanks, what_i_understood=understood, still_missing=still_missing
+                updates=updates,
+                explicitly_unknown=explicitly_unknown,
+                proceed_with_blanks=proceed_with_blanks,
+                what_i_understood=understood,
+                still_missing=still_missing,
             )
-        if schema is PlanOut:
-            return PlanOut(
-                issues=["Maintainability", "Jurisdiction", "Limitation", "Merits", "Reliefs"],
-                outline=["Cause title", "Facts", "Cause of action", "Jurisdiction", "Prayer", "Verification"],
-                critical_missing_facts=[],
+        if schema is DraftPlanOut:
+            return DraftPlanOut(
+                issues=["Jurisdiction", "Limitation", "Reliefs"],
+                outline=["CAUSE TITLE", "FACTS", "CAUSE OF ACTION", "JURISDICTION", "PRAYER", "VERIFICATION"],
+                pleading_notes=[
+                    "Keep pleadings to material facts; list documents separately as annexures.",
+                    "Ensure Order VII plaint particulars are covered (TO VERIFY).",
+                ],
+                missing_inputs=[],
             )
-        if schema is ResearchOut:
-            return ResearchOut(
-                tasks=[ResearchTask(issue="Jurisdiction", to_verify=["CPC territorial/pecuniary rules (TO VERIFY)"])]
+        if schema is ResearchPlanOut:
+            return ResearchPlanOut(
+                tasks=[
+                    ResearchTask(
+                        task_id="T1",
+                        issue="Pleading requirements",
+                        research_question="What are the key plaint particulars and pleading discipline points under CPC? (TO VERIFY)",
+                        priority=1,
+                        expected_authorities=["CPC Order VI Rule 2", "CPC Order VII"],
+                    ),
+                    ResearchTask(
+                        task_id="T2",
+                        issue="Limitation",
+                        research_question="Which limitation period likely applies on these facts? (TO VERIFY)",
+                        priority=2,
+                        expected_authorities=["Limitation Act, 1963 (TO VERIFY)"],
+                    ),
+                ]
             )
-        if schema is DraftOut:
-            return DraftOut(
-                draft_text="(mock) PLAINT DRAFT\n[BLANK: replace with LLM output]\n",
-                one_page_brief="(mock) brief\n",
-                blanks=["replace with LLM output"],
-                annexures=[],
-                next_steps=["(mock) run with real LLM for full draft"],
+        if schema is ResearchResultOut:
+            task_obj = parse_json_object("Research task (JSON):")
+            task_id = str(task_obj.get("task_id") or "T?")
+            issue = str(task_obj.get("issue") or "Issue")
+            return ResearchResultOut(
+                task_id=task_id,
+                issue=issue,
+                findings=[
+                    "Pleadings should contain material facts and not evidence (TO VERIFY).",
+                    "Plaint should contain particulars required by CPC Order VII (TO VERIFY).",
+                ],
+                citations=[
+                    Citation(
+                        source_type="statute",
+                        citation="Code of Civil Procedure, 1908 (CPC)",
+                        pinpoint="Order VI Rule 2; Order VII (plaint particulars) (TO VERIFY)",
+                        confidence="low",
+                        verified=False,
+                    )
+                ],
+                confidence="low",
+                conflicts=[],
+                to_verify=["Verify exact CPC rule text and local rules."],
             )
-        if schema is ComplianceOut:
-            return ComplianceOut(ok=True, missing_items=[], fix_questions=[])
+        if schema is CompiledDraftOut:
+            case_file = parse_json_object("Case file (JSON):")
+            missing_inputs_any = parse_json_list("Missing inputs (placeholders accepted) (JSON list):")
+            missing_inputs = [str(x) for x in missing_inputs_any if isinstance(x, (str, int, float))]
+
+            def as_lines(v: Any) -> list[str]:
+                if v is None:
+                    return []
+                if isinstance(v, list):
+                    return [str(x).strip() for x in v if str(x).strip()]
+                s = str(v).strip()
+                if not s:
+                    return []
+                return [ln.strip() for ln in s.splitlines() if ln.strip()]
+
+            court_name = str(case_file.get("court_name") or "IN THE COURT OF ...").strip()
+            plaintiff = str(case_file.get("plaintiff") or "<<PLACEHOLDER: plaintiff>>").strip()
+            defendant = str(case_file.get("defendant") or "<<PLACEHOLDER: defendant>>").strip()
+            facts = as_lines(case_file.get("facts_timeline")) or ["<<PLACEHOLDER: facts_timeline>>"]
+            reliefs = as_lines(case_file.get("reliefs")) or ["<<PLACEHOLDER: reliefs>>"]
+            docs = as_lines(case_file.get("documents"))
+            return CompiledDraftOut(
+                court_name=court_name,
+                cause_title=f"IN THE COURT OF {court_name}",
+                parties=[f"PLAINTIFF: {plaintiff}", f"DEFENDANT: {defendant}"],
+                facts_paragraphs=facts,
+                cause_of_action_paragraphs=[str(case_file.get("cause_of_action") or "<<PLACEHOLDER: cause_of_action>>")],
+                jurisdiction_paragraphs=[str(case_file.get("jurisdiction_facts") or "<<PLACEHOLDER: jurisdiction_facts>>")],
+                limitation_paragraph=str(case_file.get("limitation") or "<<PLACEHOLDER: limitation>>"),
+                valuation_paragraph=f"Valuation: {case_file.get('valuation', '<<PLACEHOLDER: valuation>>')}. Court fee: {case_file.get('court_fee', '<<PLACEHOLDER: court_fee>>')}.",
+                reliefs=reliefs,
+                interim_reliefs=as_lines(case_file.get("interim_reliefs")),
+                documents=docs,
+                verification="Verified at ____ on ____ that the contents are true to my knowledge (TO VERIFY local form).",
+                statement_of_truth=(
+                    "Statement of Truth / affidavit as applicable (TO VERIFY)."
+                    if str(case_file.get("is_commercial_dispute") or "").strip().lower() in {"y", "yes", "true", "1"}
+                    else None
+                ),
+                one_page_brief="(mock) One-page brief: parties, dispute, reliefs.",
+                next_steps=["(mock) Have an advocate review and finalize court fee/limitation/jurisdiction."],
+                missing_inputs=missing_inputs,
+                assumptions_used=missing_inputs,
+                risk_flags=[],
+                citations_used=[],
+                conflict_resolutions=[],
+            )
 
         return schema()  # type: ignore[call-arg]
 
@@ -979,11 +1115,21 @@ def node_init(_: PlaintState, runtime: Runtime[Ctx]) -> PlaintState:
         "route": {},
         "ris": {},
         "validation": {},
+        "intake_batch": {},
+        "last_user_answer": "",
         "case_file": {},
         "blanks": [],
         "blanks_accepted": [],
         "qa_log": [],
+        "draft_plan": {},
+        "research_plan": {},
         "research_results": [],
+        "research_pack": {},
+        "compiled": {},
+        "assembled": {},
+        "final_draft": {},
+        "audit_pack": {},
+        "final_review": {},
         "revision_count": 0,
         "log": [f"init(case_id={runtime.context.case_id})"],
     }
@@ -1724,39 +1870,41 @@ builder.add_edge("deliver", END)
 
 
 DEMO_ANSWERS: list[str] = [
-    # Batch 1: court + parties
-    "\n".join([
-        "court_name: City Civil Court at Bengaluru",
-        "plaintiff: Mr. A, adult Indian citizen",
-        "defendant: M/s B Pvt Ltd, company incorporated under Companies Act",
-        "plaintiff_address: Bengaluru, Karnataka (service address)",
-        "defendant_address: Bengaluru, Karnataka (registered office/service)",
-    ]),
-    # Batch 2: facts
-    "\n".join([
-        "2024-01-10: Service contract executed at Bengaluru.",
-        "2024-02-05: Invoice raised for INR 5,00,000 payable within 15 days.",
-        "2024-03-01: Reminder issued; no payment received.",
-    ]),
-    # Batch 3: cause
-    "Defendant failed to pay the invoice amount despite contractual obligation and repeated demands.",
-    # Batch 4: jurisdiction
-    "Cause of action arose in Bengaluru; contract executed/performed in Bengaluru; defendant carries on business in Bengaluru.",
-    # Batch 5: reliefs
-    "\n".join([
-        "Decree for INR 5,00,000 with interest.",
-        "Costs of the suit.",
-        "Any other relief deemed fit.",
-    ]),
-    # Batch 6: valuation + court fee
-    "\n".join([
-        "valuation: INR 5,00,000",
-        "court_fee: TO BE COMPUTED AS PER APPLICABLE COURT FEE ACT (BLANK)",
-    ]),
-    # Batch 7: documents
-    "\n".join(["Service contract dated 2024-01-10", "Invoice dated 2024-02-05", "Reminder email dated 2024-03-01"]),
-    # Batch 8: limitation
-    "Within limitation as cause of action arose in 2024.",
+    # Batch 1: first 6 mandatory keys (+ proceed_with_blanks asked by the system)
+    "\n".join(
+        [
+            "court_name: City Civil Court at Bengaluru",
+            "plaintiff: Mr. A, adult Indian citizen",
+            "defendant: M/s B Pvt Ltd, company incorporated under Companies Act",
+            "plaintiff_address: Bengaluru, Karnataka (service address)",
+            "defendant_address: Bengaluru, Karnataka (registered office/service)",
+            "facts_timeline: 2024-01-10 contract executed at Bengaluru; 2024-02-05 invoice for INR 5,00,000; 2024-03-01 reminder; non-payment continues.",
+            "proceed_with_blanks: no",
+        ]
+    ),
+    # Batch 2: next mandatory keys
+    "\n".join(
+        [
+            "cause_of_action: Defendant failed to pay the invoice amount despite contractual obligation and repeated demands.",
+            "jurisdiction_facts: Cause of action arose in Bengaluru; contract executed/performed in Bengaluru; defendant carries on business in Bengaluru.",
+            "reliefs: Decree for INR 5,00,000 with interest; costs; any other relief deemed fit.",
+            "interim_relief_needed: no",
+            "valuation: INR 5,00,000",
+            "court_fee: TO BE COMPUTED AS PER APPLICABLE COURT FEE ACT (TO VERIFY)",
+            "proceed_with_blanks: no",
+        ]
+    ),
+    # Batch 3: remaining mandatory keys
+    "\n".join(
+        [
+            "limitation: Within limitation based on 2024 cause of action (TO VERIFY).",
+            "documents: Service contract dated 2024-01-10; Invoice dated 2024-02-05; Reminder email dated 2024-03-01.",
+            "is_commercial_dispute: no",
+            "proceed_with_blanks: no",
+        ]
+    ),
+    # Final review
+    "approved: yes",
 ]
 
 
@@ -1773,13 +1921,27 @@ def print_interrupt_prompt(prompt: dict) -> None:
             print(f"- {key}{suffix}: {question}")
             if example:
                 print(f"  example: {example}")
-    if prompt.get("missing"):
-        print("\nMissing items:")
-        for m in prompt["missing"]:
+    if prompt.get("missing_required_fields"):
+        print("\nMissing required fields (blockers):")
+        for m in prompt["missing_required_fields"]:
             print("- " + str(m))
+    if prompt.get("risk_flags"):
+        print("\nRisk flags:")
+        for r in prompt["risk_flags"]:
+            print("- " + str(r))
     if prompt.get("answer_format"):
         print("\nAnswer format:")
         print(str(prompt["answer_format"]))
+    if prompt.get("one_page_brief"):
+        print("\nOne-page brief:")
+        print(str(prompt["one_page_brief"]))
+    if prompt.get("missing_inputs"):
+        print("\nMissing inputs (placeholders):")
+        for m in prompt["missing_inputs"]:
+            print("- " + str(m))
+    if prompt.get("draft_preview"):
+        print("\nDraft preview:")
+        print(str(prompt["draft_preview"]))
     if prompt.get("instructions"):
         print("\nInstructions:")
         print(str(prompt["instructions"]))
@@ -1830,7 +1992,7 @@ def run(*, demo: bool, mock: bool, thread_id: str | None, case_id: str | None, r
                     ans = read_multiline()
                     state_in = Command(resume=ans)
                 else:
-                    state_in = {"case_file": {}, "qa_log": [], "log": [], "blanks": []}
+                    state_in = {}
             demo_answers = list(DEMO_ANSWERS)
 
             while True:
@@ -1846,13 +2008,14 @@ def run(*, demo: bool, mock: bool, thread_id: str | None, case_id: str | None, r
                         print_interrupt_prompt(prompt)
 
                         if demo:
-                            if isinstance(prompt, dict) and prompt.get("missing"):
-                                # Minimum gate: allow continuing with blanks so the demo completes.
-                                answer = "proceed_with_blanks: yes"
-                            elif not demo_answers:
-                                answer = "proceed_with_blanks: yes"
-                            else:
+                            if demo_answers:
                                 answer = demo_answers.pop(0)
+                            else:
+                                title_text = str(prompt.get("title", "")).lower()
+                                if "final review" in title_text:
+                                    answer = "approved: yes"
+                                else:
+                                    answer = "proceed_with_blanks: yes"
                             step("Demo answer used")
                             print(answer)
                         else:
@@ -1868,8 +2031,7 @@ def run(*, demo: bool, mock: bool, thread_id: str | None, case_id: str | None, r
                         step(f"node: {node_name}")
                         if node_name in {"init"}:
                             show("meta", payload)
-                        elif node_name in {"intake"} and isinstance(payload, dict):
-                            # show last update summary if present
+                        elif node_name in {"answer_extractor"} and isinstance(payload, dict):
                             show("case_file_keys", sorted(list((payload.get("case_file") or {}).keys())))
                         elif node_name in {"deliver"} and isinstance(payload, dict):
                             show("output_dir", payload.get("output_dir"))
