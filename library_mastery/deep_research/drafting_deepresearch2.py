@@ -16,6 +16,7 @@ You asked for:
     4) Annexures list
     5) Filing/compliance checklist
     6) Next steps
+    7) Audit pack (facts, assumptions, risks, sources)
 
 This script is a LEARNING PROJECT.
 It is NOT legal advice. Always get a qualified advocate to review before filing.
@@ -39,7 +40,6 @@ Offline mode (no API key; uses simple mock agents):
 import hashlib
 import json
 import os
-import re
 import sys
 import textwrap
 import uuid
@@ -358,6 +358,18 @@ class IntakeExtractOut(BaseModel):
     )
     what_i_understood: str = Field(default="")
     still_missing: list[str] = Field(default_factory=list, description="Keys (from expected_keys) not addressed.")
+
+
+class QAEntry(BaseModel):
+    batch: str
+    questions: list[Question] = Field(default_factory=list)
+    answer: str
+    expected_keys: list[str] = Field(default_factory=list)
+    updates: dict[str, str] = Field(default_factory=dict)
+    explicitly_unknown: list[str] = Field(default_factory=list)
+    proceed_with_blanks: Optional[bool] = Field(default=None)
+    what_i_understood: str = Field(default="")
+    still_missing: list[str] = Field(default_factory=list)
 
 
 class DraftPlanOut(BaseModel):
@@ -1409,23 +1421,23 @@ def node_answer_extractor(state: PlaintState, runtime: Runtime[Ctx]) -> PlaintSt
     store_put(runtime, ("cases", runtime.context.case_id), "case_file", case_file)
     store_put(runtime, ("cases", runtime.context.case_id), "blanks", {"blanks": blanks, "blanks_accepted": blanks_accepted})
 
-    qa_entry = {
-        "batch": batch.get("batch_name", ""),
-        "questions": batch.get("questions", []),
-        "answer": answer_text,
-        "expected_keys": expected_keys,
-        "updates": extracted_updates,
-        "explicitly_unknown": extracted_unknowns,
-        "proceed_with_blanks": bool(proceed) if proceed is not None else None,
-        "what_i_understood": extracted.what_i_understood,
-        "still_missing": extracted.still_missing,
-    }
+    qa = QAEntry(
+        batch=str(batch.get("batch_name", "") or ""),
+        questions=[Question.model_validate(q) for q in (batch.get("questions", []) or [])],
+        answer=answer_text,
+        expected_keys=expected_keys,
+        updates=extracted_updates,
+        explicitly_unknown=extracted_unknowns,
+        proceed_with_blanks=bool(proceed) if proceed is not None else None,
+        what_i_understood=extracted.what_i_understood,
+        still_missing=list(extracted.still_missing or []),
+    )
 
     return {
         "case_file": case_file,
         "blanks": blanks,
         "blanks_accepted": blanks_accepted,
-        "qa_log": [qa_entry],
+        "qa_log": [qa.model_dump()],
         "log": [f"intake applied updates={list(extracted_updates.keys())} proceed_with_blanks={proceed}"],
     }
 
@@ -1537,6 +1549,9 @@ def node_research_worker(state: dict[str, Any]) -> PlaintState:
         user=user_prompt,
         schema=ResearchResultOut,
     )
+    # Enforce task identity (prevents drift across fan-out workers).
+    if out.task_id != task.task_id or out.issue != task.issue:
+        out = out.model_copy(update={"task_id": task.task_id, "issue": task.issue})
     return {"research_results": [out.model_dump()], "log": [f"research done {out.task_id}"]}
 
 
@@ -1626,6 +1641,49 @@ def node_compiler(state: PlaintState, runtime: Runtime[Ctx]) -> PlaintState:
         system=COMPILER_SYSTEM,
         user=user_prompt,
         schema=CompiledDraftOut,
+    )
+    # Enforce "audit pack" invariants deterministically (prevents silent omission).
+    merged_missing_inputs: list[str] = []
+    for item in list(out.missing_inputs or []) + missing_inputs:
+        s = str(item).strip()
+        if s and s not in merged_missing_inputs:
+            merged_missing_inputs.append(s)
+
+    report_risk_flags = [str(x).strip() for x in (report.get("risk_flags", []) or []) if str(x).strip()]
+    merged_risk_flags: list[str] = []
+    for item in report_risk_flags + list(out.risk_flags or []):
+        s = str(item).strip()
+        if s and s not in merged_risk_flags:
+            merged_risk_flags.append(s)
+
+    allowed_citations: list[Citation] = [
+        Citation.model_validate(c) for c in (research_pack.get("citations", []) or []) if isinstance(c, dict)
+    ]
+    allowed_keys = {
+        (c.source_type, c.citation.strip(), (c.pinpoint or "").strip(), (c.url or "").strip()) for c in allowed_citations
+    }
+
+    filtered_used: list[Citation] = []
+    for c in out.citations_used or []:
+        key = (c.source_type, c.citation.strip(), (c.pinpoint or "").strip(), (c.url or "").strip())
+        if key in allowed_keys:
+            filtered_used.append(c)
+
+    # Fill obvious defaults from the case file.
+    court_name = out.court_name.strip() or str(case_file.get("court_name") or "").strip()
+    cause_title = out.cause_title.strip()
+    if (not cause_title or cause_title == "IN THE COURT OF ...") and court_name:
+        cause_title = f"IN THE COURT OF {court_name}"
+
+    out = out.model_copy(
+        update={
+            "court_name": court_name,
+            "cause_title": cause_title or out.cause_title,
+            "missing_inputs": merged_missing_inputs,
+            "assumptions_used": merged_missing_inputs,
+            "risk_flags": merged_risk_flags,
+            "citations_used": filtered_used,
+        }
     )
     store_put(runtime, ("cases", runtime.context.case_id), "compiled", out.model_dump())
     return {"compiled": out.model_dump(), "log": ["compiled draft payload created"]}
