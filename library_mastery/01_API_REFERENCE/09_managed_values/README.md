@@ -9,6 +9,9 @@ Goal: understand managed values as “runtime-computed state”:
 
 ## Files
 
+- `00_cookbook.py`
+  - production-first managed values usage (graceful stop + schema rules)
+
 - `managed_values_basic.py`
   - reads `RemainingSteps` / `IsLastStep` inside a node
 
@@ -23,4 +26,3 @@ Goal: understand managed values as “runtime-computed state”:
 ```bash
 ./.venv/bin/python library_mastery/01_API_REFERENCE/09_managed_values/managed_values_over_steps.py
 ```
-

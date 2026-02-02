@@ -9,6 +9,9 @@ Goal: understand the building blocks behind “tool-calling agents”:
 
 ## Files
 
+- `00_cookbook.py`
+  - production-first agent building blocks: ToolNode, tools_condition, injection, error handling
+
 - `toolnode_with_tools_condition.py`
   - builds a tiny graph that:
     - creates an `AIMessage(tool_calls=[...])`
@@ -24,4 +27,3 @@ Goal: understand the building blocks behind “tool-calling agents”:
 ```bash
 ./.venv/bin/python library_mastery/01_API_REFERENCE/13_prebuilt_tooling/tool_injection_state_and_store.py
 ```
-

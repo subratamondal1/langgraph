@@ -9,6 +9,9 @@ Goal: treat the store as shared, queryable memory:
 
 ## Files
 
+- `00_cookbook.py`
+  - production-first store usage: CRUD + injection into graphs via `Runtime.store`
+
 - `store_basics.py`
   - demonstrates `put`, `get`, `search(filter=...)`, and `list_namespaces`
 
@@ -21,4 +24,3 @@ Goal: treat the store as shared, queryable memory:
 ```bash
 ./.venv/bin/python library_mastery/01_API_REFERENCE/11_store/store_used_from_graph.py
 ```
-

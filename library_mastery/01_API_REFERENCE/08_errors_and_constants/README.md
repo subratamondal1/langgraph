@@ -9,6 +9,9 @@ Goal: debug production graphs quickly:
 
 ## Files
 
+- `00_cookbook.py`
+  - production-first debugging patterns for common exceptions + constants/deprecation traps
+
 - `recursion_limit_error.py`
   - triggers and catches `GraphRecursionError`
   - prints the first line of the message (includes a troubleshooting link)
@@ -25,4 +28,3 @@ Goal: debug production graphs quickly:
 ```bash
 ./.venv/bin/python library_mastery/01_API_REFERENCE/08_errors_and_constants/constants_deprecation_proxy.py
 ```
-

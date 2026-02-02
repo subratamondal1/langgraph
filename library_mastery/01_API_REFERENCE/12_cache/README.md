@@ -9,6 +9,9 @@ Goal: understand caching as a first-class runtime capability:
 
 ## Files
 
+- `00_cookbook.py`
+  - production-first caching: direct cache usage + node caching via `CachePolicy`
+
 - `cache_basics.py`
   - demonstrates `InMemoryCache.get/set/clear` directly
   - shows namespaces and TTL behavior (no graph involved)
@@ -23,4 +26,3 @@ Goal: understand caching as a first-class runtime capability:
 ```bash
 ./.venv/bin/python library_mastery/01_API_REFERENCE/12_cache/graph_node_caching.py
 ```
-

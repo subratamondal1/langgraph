@@ -9,6 +9,9 @@ Goal: understand how checkpoint/cache payloads become bytes (and how to harden i
 
 ## Files
 
+- `00_cookbook.py`
+  - production-first serde patterns: safe JsonPlus defaults + optional encryption wrapper
+
 - `jsonplus_roundtrip.py`
   - round-trips a Python object through `JsonPlusSerializer`
   - prints byte length + decoded value so you can debug exactly what’s being persisted
@@ -22,4 +25,3 @@ Goal: understand how checkpoint/cache payloads become bytes (and how to harden i
 ```bash
 ./.venv/bin/python library_mastery/01_API_REFERENCE/14_serde_encryption/jsonplus_roundtrip.py
 ```
-

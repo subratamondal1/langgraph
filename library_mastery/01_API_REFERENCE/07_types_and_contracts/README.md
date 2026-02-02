@@ -10,6 +10,9 @@ Goal: understand the “control plane” primitives that make LangGraph more tha
 
 ## Files
 
+- `00_cookbook.py`
+  - production-first control-plane patterns: `Send`, `Command`, `interrupt/resume`, `Overwrite`
+
 - `command_goto_routing.py`
   - uses `Command(goto=...)` to choose the next node dynamically
   - shows how this differs from static edges
@@ -25,4 +28,3 @@ Goal: understand the “control plane” primitives that make LangGraph more tha
 ```bash
 ./.venv/bin/python library_mastery/01_API_REFERENCE/07_types_and_contracts/command_goto_routing.py
 ```
-

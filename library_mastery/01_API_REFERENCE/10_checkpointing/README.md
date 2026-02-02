@@ -9,6 +9,9 @@ Goal: understand checkpointing as “versioned short-term memory”:
 
 ## Files
 
+- `00_cookbook.py`
+  - production-first checkpointing: thread_id, state snapshots/history, interrupt/resume
+
 - `state_history_introspection.py`
   - runs a 2-step graph with an `InMemorySaver`
   - prints the resulting `StateSnapshot`
@@ -24,4 +27,3 @@ Goal: understand checkpointing as “versioned short-term memory”:
 ```bash
 ./.venv/bin/python library_mastery/01_API_REFERENCE/10_checkpointing/interrupt_and_resume_inspect.py
 ```
-
