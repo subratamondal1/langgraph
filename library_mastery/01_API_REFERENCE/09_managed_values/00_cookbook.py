@@ -20,10 +20,18 @@ def recipe_managed_values_to_stop_before_recursion() -> None:
     from langgraph.graph import StateGraph
     from langgraph.managed import IsLastStep, RemainingSteps
 
+    # With `from __future__ import annotations`, these names must be resolvable from module globals
+    # when LangGraph evaluates schema annotations via `typing.get_type_hints(...)`.
+    globals().update({"IsLastStep": IsLastStep, "RemainingSteps": RemainingSteps})
+
     class State(TypedDict, total=False):
         remaining: RemainingSteps
         is_last: IsLastStep
         log: Annotated[list[str], append]
+
+    # Make `State` resolvable when LangGraph calls `typing.get_type_hints(...)` on the
+    # node/router functions (which reads from the function's module globals).
+    globals().update({"State": State})
 
     def observe(state: State) -> State:
         return {"log": [f"remaining={state.get('remaining')}, is_last={state.get('is_last')}"]}
@@ -49,6 +57,8 @@ def recipe_managed_values_forbidden_in_input_output() -> None:
     from langgraph.graph import StateGraph
     from langgraph.managed import RemainingSteps
 
+    globals().update({"RemainingSteps": RemainingSteps})
+
     class State(TypedDict, total=False):
         remaining: RemainingSteps
         x: int
@@ -73,4 +83,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
