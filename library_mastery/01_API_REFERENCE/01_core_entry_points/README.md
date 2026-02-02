@@ -35,6 +35,10 @@ Each folder contains:
 - `README.md` (the “why” + key mental models)
 - One or more `*.py` scripts (the “how”)
 
+## Cookbook
+
+- `00_cookbook.py` is the “production-first” tour: minimal Graph API, Functional API, and ToolNode patterns.
+
 ## Running the scripts (repo checkout)
 
 The scripts include a tiny `sys.path` bootstrap (via `library_mastery/01_API_REFERENCE/_bootstrap.py`) so they can be run from a repo checkout without installing packages.

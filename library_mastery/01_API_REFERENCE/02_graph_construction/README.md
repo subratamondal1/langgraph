@@ -10,6 +10,10 @@ Goal: understand `StateGraph` like a senior engineer:
 
 ## Files
 
+- `00_cookbook.py`
+  - production-first patterns for building/compiling/streaming graphs
+  - includes the most common failure mode (two writers) + the reducer fix
+
 - `build_visualize_and_stream.py`
   - builds a small graph with conditional routing
   - prints `graph.get_graph().draw_ascii()`
@@ -30,4 +34,3 @@ From repo root:
 ```bash
 ./.venv/bin/python library_mastery/01_API_REFERENCE/02_graph_construction/build_visualize_and_stream.py
 ```
-

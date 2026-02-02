@@ -10,6 +10,9 @@ Goal: treat the functional API like a serious workflow runtime:
 
 ## Files
 
+- `00_cookbook.py`
+  - production-first patterns: tasks, previous, retry/cache, interrupt/resume
+
 - `fanout_fanin_tasks.py`
   - shows how tasks return futures and how you join results
 
@@ -25,4 +28,3 @@ Goal: treat the functional API like a serious workflow runtime:
 ```bash
 ./.venv/bin/python library_mastery/01_API_REFERENCE/04_functional_api/retry_and_cache_policies.py
 ```
-

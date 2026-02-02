@@ -10,6 +10,10 @@ Goal: understand how the runtime actually executes work:
 
 ## Files
 
+- `00_cookbook.py`
+  - production-first Pregel usage: channels + NodeBuilder + streaming
+  - includes a cycle-until-stop pattern (common in agent loops)
+
 - `pregel_debug_stream.py`
   - builds a small Pregel app with multiple nodes/channels
   - prints the drawable graph (`get_graph().draw_ascii()`)
@@ -24,4 +28,3 @@ Goal: understand how the runtime actually executes work:
 ```bash
 ./.venv/bin/python library_mastery/01_API_REFERENCE/03_execution_engine/pregel_debug_stream.py
 ```
-

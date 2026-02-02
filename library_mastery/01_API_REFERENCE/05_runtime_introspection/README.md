@@ -9,6 +9,9 @@ Goal: understand what gets injected at runtime and how to debug a run:
 
 ## Files
 
+- `00_cookbook.py`
+  - production-first runtime patterns: `Runtime` injection + store + custom stream events
+
 - `runtime_injection_vs_helpers.py`
   - shows two ways to access run-scoped resources: `Runtime[...]` injection vs `get_store()`
 
@@ -21,4 +24,3 @@ Goal: understand what gets injected at runtime and how to debug a run:
 ```bash
 ./.venv/bin/python library_mastery/01_API_REFERENCE/05_runtime_introspection/custom_stream_events.py
 ```
-

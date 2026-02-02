@@ -9,6 +9,9 @@ Goal: understand channels as the core state/merge primitive:
 
 ## Files
 
+- `00_cookbook.py`
+  - production-first channel selection + schema-to-channel compilation
+
 - `channel_semantics_after_finish.py`
   - demonstrates channels whose values only become readable after `finish()`
   - shows `consume()` clearing semantics
@@ -22,4 +25,3 @@ Goal: understand channels as the core state/merge primitive:
 ```bash
 ./.venv/bin/python library_mastery/01_API_REFERENCE/06_channels/schema_compiles_to_channels.py
 ```
-
