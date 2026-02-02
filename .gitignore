@@ -100,3 +100,6 @@ dmypy.json
 .turbo
 .editorconfig
 .scratch
+
+# Generated local data (drafting_deepreearch.py)
+_drafting_deepreearch_data/
