@@ -139,6 +139,174 @@ def read_multiline() -> str:
     return "\n".join(lines).strip()
 
 
+def _truncate_middle(text: str, *, max_len: int = 160) -> str:
+    t = (text or "").strip().replace("\n", " ")
+    if len(t) <= max_len:
+        return t
+    half = max_len // 2 - 2
+    return f"{t[:half]} … {t[-half:]}"
+
+
+def _normalize_kv_value(value: str) -> str:
+    return " ".join((value or "").strip().splitlines()).strip()
+
+
+def _is_intake_prompt(prompt: object) -> bool:
+    if not isinstance(prompt, dict):
+        return False
+    questions = prompt.get("questions")
+    if not isinstance(questions, list) or not questions:
+        return False
+    first = questions[0]
+    return isinstance(first, dict) and ("key" in first) and ("question" in first)
+
+
+def _intake_batch_id(prompt: dict) -> str:
+    questions = prompt.get("questions") if isinstance(prompt.get("questions"), list) else []
+    keys: list[str] = []
+    for q in questions:
+        if isinstance(q, dict) and q.get("key"):
+            keys.append(str(q["key"]))
+    raw = json.dumps({"title": str(prompt.get("title", "")), "keys": keys}, sort_keys=True)
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:12]
+
+
+def run_intake_interview(*, prompt: dict, case_dir: Path) -> str:
+    """
+    Ask intake questions one-by-one (professional CLI UX) and return a key:value payload
+    to resume the LangGraph interrupt.
+    """
+    batch_id = _intake_batch_id(prompt)
+    session_path = case_dir / f"intake_{batch_id}.json"
+
+    session: dict[str, Any] = {}
+    if session_path.exists():
+        try:
+            session = json.loads(session_path.read_text(encoding="utf-8"))
+        except Exception:
+            session = {}
+
+    now = datetime.now().isoformat(timespec="seconds")
+    questions = prompt.get("questions") if isinstance(prompt.get("questions"), list) else []
+    answers: dict[str, str] = {}
+    if isinstance(session.get("answers"), dict):
+        answers = {str(k): str(v) for k, v in session["answers"].items()}
+
+    session = {
+        "batch_id": batch_id,
+        "title": str(prompt.get("title", "")),
+        "started_at": session.get("started_at") or now,
+        "updated_at": now,
+        "questions": questions,
+        "answers": answers,
+        "completed": False,
+    }
+
+    def persist() -> None:
+        session["updated_at"] = datetime.now().isoformat(timespec="seconds")
+        session_path.write_text(json.dumps(session, indent=2), encoding="utf-8")
+
+    title(str(prompt.get("title", "Intake")))
+    if prompt.get("missing_required_fields"):
+        print("\nBlockers:")
+        for m in prompt["missing_required_fields"]:
+            print("- " + str(m))
+    if prompt.get("risk_flags"):
+        print("\nRisks:")
+        for r in prompt["risk_flags"]:
+            print("- " + str(r))
+
+    print(
+        wrap(
+            """
+            Answer each question one-by-one.
+            - Press Enter to skip optional questions.
+            - Type "unknown" if you don't know.
+            - Type "!m" for a multi-line answer (finish with an empty line).
+            """
+        )
+    )
+
+    persist()
+
+    total = len(questions)
+    for idx, q in enumerate(questions, start=1):
+        if not isinstance(q, dict):
+            continue
+        key = str(q.get("key") or "").strip()
+        question = str(q.get("question") or "").strip()
+        if not key or not question:
+            continue
+
+        required = bool(q.get("required", True))
+        category = str(q.get("category") or "").strip()
+        example = q.get("example")
+
+        while True:
+            print(f"\n[{idx}/{total}] {question}")
+            meta_bits = [f"key={key}", "required" if required else "optional"]
+            if category:
+                meta_bits.append(category)
+            print("(" + ", ".join(meta_bits) + ")")
+            if example:
+                print("example: " + str(example))
+            previous = answers.get(key)
+            if previous is not None and previous.strip():
+                print("saved: " + _truncate_middle(previous))
+                raw = input("> (Enter to keep, or type new) ").strip()
+                if raw == "":
+                    value = previous
+                else:
+                    if raw == "!m":
+                        value = read_multiline()
+                    else:
+                        value = raw
+            else:
+                raw = input("> ").strip()
+                if raw == "!m":
+                    value = read_multiline()
+                else:
+                    value = raw
+
+            lowered = value.strip().lower()
+            if lowered in {"unknown", "[unknown]"}:
+                value = "[UNKNOWN]"
+
+            if value.strip() == "":
+                if required:
+                    print("This is required. Enter a value, or type \"unknown\".")
+                    continue
+                # optional skip
+                answers[key] = ""
+                break
+
+            answers[key] = value
+            break
+
+        session["answers"] = answers
+        persist()
+
+    session["completed"] = True
+    persist()
+
+    # Build a compact key:value payload for the next agent (answer_extractor).
+    kv_lines: list[str] = []
+    for q in questions:
+        if not isinstance(q, dict) or not q.get("key"):
+            continue
+        key = str(q["key"]).strip()
+        if not key:
+            continue
+        value = answers.get(key, "")
+        if value is None:
+            continue
+        value = str(value)
+        if value.strip() == "":
+            continue
+        kv_lines.append(f"{key}: {_normalize_kv_value(value)}")
+    return "\n".join(kv_lines).strip()
+
+
 # -----------------------------
 # 3) Project identity (fixed)
 # -----------------------------
@@ -2099,7 +2267,9 @@ def print_interrupt_prompt(prompt: dict) -> None:
         print(str(prompt["note"]))
 
 
-def run(*, demo: bool, mock: bool, thread_id: str | None, case_id: str | None, resume_answer: str | None) -> None:
+def run(
+    *, demo: bool, mock: bool, verbose: bool, thread_id: str | None, case_id: str | None, resume_answer: str | None
+) -> None:
     global ENGINE
 
     if case_id is None:
@@ -2109,6 +2279,8 @@ def run(*, demo: bool, mock: bool, thread_id: str | None, case_id: str | None, r
 
     config = {"configurable": {"thread_id": thread_id}}
     context = Ctx(case_id=case_id, user_id="u1")
+    case_dir = ARTIFACTS_DIR / f"case_{case_id}"
+    case_dir.mkdir(exist_ok=True)
 
     title("Deep Research: Litigation Drafting → Civil Pleadings → PLAINT")
     show("case_id", case_id)
@@ -2157,8 +2329,11 @@ def run(*, demo: bool, mock: bool, thread_id: str | None, case_id: str | None, r
                     if not isinstance(prompt, dict):
                         prompt = {"title": "INTERRUPT", "note": str(prompt)}
                     step("Found a pending interrupt for this thread_id. Answer to resume.")
-                    print_interrupt_prompt(prompt)
-                    ans = read_multiline()
+                    if _is_intake_prompt(prompt):
+                        ans = run_intake_interview(prompt=prompt, case_dir=case_dir)
+                    else:
+                        print_interrupt_prompt(prompt)
+                        ans = read_multiline()
                     state_in = Command(resume=ans)
                 else:
                     state_in = {}
@@ -2174,8 +2349,6 @@ def run(*, demo: bool, mock: bool, thread_id: str | None, case_id: str | None, r
                         if not isinstance(prompt, dict):
                             prompt = {"title": "INTERRUPT", "note": str(prompt)}
 
-                        print_interrupt_prompt(prompt)
-
                         if demo:
                             if demo_answers:
                                 answer = demo_answers.pop(0)
@@ -2186,27 +2359,36 @@ def run(*, demo: bool, mock: bool, thread_id: str | None, case_id: str | None, r
                                 else:
                                     answer = "proceed_with_blanks: yes"
                             step("Demo answer used")
+                            if _is_intake_prompt(prompt):
+                                title(str(prompt.get("title", "Intake")))
+                                print("(demo) auto-answering intake batch")
+                            else:
+                                print_interrupt_prompt(prompt)
                             print(answer)
                         else:
-                            answer = read_multiline()
+                            if _is_intake_prompt(prompt):
+                                answer = run_intake_interview(prompt=prompt, case_dir=case_dir)
+                            else:
+                                print_interrupt_prompt(prompt)
+                                answer = read_multiline()
 
                         state_in = Command(resume=answer)
                         break
 
-                    # Show node updates (compact)
+                    # Stream updates: default is quiet (show only log lines); use --verbose for full payloads.
                     if isinstance(chunk, dict) and len(chunk) == 1:
                         node_name = next(iter(chunk.keys()))
                         payload = chunk[node_name]
-                        step(f"node: {node_name}")
-                        if node_name in {"init"}:
-                            show("meta", payload)
-                        elif node_name in {"answer_extractor"} and isinstance(payload, dict):
-                            show("case_file_keys", sorted(list((payload.get("case_file") or {}).keys())))
-                        elif node_name in {"deliver"} and isinstance(payload, dict):
-                            show("output_dir", payload.get("output_dir"))
-                        else:
+                        if verbose:
+                            step(f"node: {node_name}")
                             show("update", payload)
-                    else:
+                        else:
+                            logs: list[str] = []
+                            if isinstance(payload, dict) and isinstance(payload.get("log"), list):
+                                logs = [str(x) for x in payload["log"] if isinstance(x, (str, int, float))]
+                            for line in logs:
+                                print(f"[{node_name}] {line}")
+                    elif verbose:
                         show("update", chunk)
 
                 if not interrupted:
@@ -2225,6 +2407,7 @@ def run(*, demo: bool, mock: bool, thread_id: str | None, case_id: str | None, r
 if __name__ == "__main__":
     demo = "--demo" in sys.argv
     mock = "--mock" in sys.argv
+    verbose = ("--verbose" in sys.argv) or ("-v" in sys.argv)
 
     thread_id: str | None = None
     case_id: str | None = None
@@ -2251,4 +2434,4 @@ if __name__ == "__main__":
         # Real LLM mode requires API key.
         require_env("OPENAI_API_KEY")
 
-    run(demo=demo, mock=mock, thread_id=thread_id, case_id=case_id, resume_answer=resume_answer)
+    run(demo=demo, mock=mock, verbose=verbose, thread_id=thread_id, case_id=case_id, resume_answer=resume_answer)
