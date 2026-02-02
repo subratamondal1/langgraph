@@ -18,6 +18,11 @@ def main() -> None:
     from langgraph.graph import END, START, StateGraph
     from langgraph.managed import IsLastStep, RemainingSteps
 
+    # This script defines the schema inside `main()`, but LangGraph evaluates
+    # schema annotations using the module globals. With `from __future__ import annotations`,
+    # the annotations are stored as strings, so we expose these names globally.
+    globals().update({"IsLastStep": IsLastStep, "RemainingSteps": RemainingSteps})
+
     class State(TypedDict, total=False):
         remaining: RemainingSteps
         is_last: IsLastStep

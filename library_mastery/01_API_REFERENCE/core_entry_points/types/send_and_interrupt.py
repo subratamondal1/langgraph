@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 from pathlib import Path
 import uuid
 import sys
@@ -17,6 +15,11 @@ def demo_send_fan_out() -> None:
     from langgraph.constants import END, START
     from langgraph.graph import StateGraph
     from langgraph.types import Send
+
+    # `StateGraph` evaluates schema annotations using module globals.
+    # With `from __future__ import annotations`, `Annotated[...]` is stored as a string,
+    # so make sure `Annotated` is available at module scope for `get_type_hints(...)`.
+    globals().update({"Annotated": Annotated})
 
     class OverallState(TypedDict):
         subjects: list[str]
