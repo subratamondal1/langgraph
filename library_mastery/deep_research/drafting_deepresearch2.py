@@ -1,25 +1,15 @@
 """
-drafting_deepresearch2.py (Deep Research • Litigation Drafting • Civil Pleadings • PLAINT)
+drafting_deepresearch2.py (Contract-Driven Deep Research • Indian Drafting)
 
-You asked for:
-- REAL multi-agent system (LLM-driven), not hard-coded prompts
-- explicit system prompts + user prompts per agent
-- ONE combination only for now:
-    category: Litigation Drafting
-    sub category: Civil Pleadings
-    type: Plaint
-- SQLite artifacts created next to this file (checkpoint/store/cache)
-- end-to-end run that produces:
-    1) Draft plaint (court-style)
-    2) One-page brief
-    3) Blanks/assumptions list (must confirm)
-    4) Annexures list
-    5) Filing/compliance checklist
-    6) Next steps
-    7) Audit pack (facts, assumptions, risks, sources)
+This script turns a multi-stage legal drafting workflow into a contract-driven, stateful LangGraph:
 
-This script is a LEARNING PROJECT.
-It is NOT legal advice. Always get a qualified advocate to review before filing.
+1) clearly defined shared state (single source of truth),
+2) strict structured outputs (per-node JSON schemas via Pydantic, extra=forbid),
+3) deterministic routing / termination criteria,
+4) fan-out/fan-in research with reducers to avoid INVALID_CONCURRENT_GRAPH_UPDATE,
+5) interrupt-based HITL so the graph pauses for user input and resumes with state preserved.
+
+NOT LEGAL ADVICE: This is an educational drafting assistant. Always have a qualified advocate review before filing.
 
 Run (interactive):
   uv run library_mastery/deep_research/drafting_deepresearch2.py
@@ -30,15 +20,54 @@ Resume an interrupted run:
 Resume by providing an answer directly:
   uv run library_mastery/deep_research/drafting_deepresearch2.py --thread "<thread_id>" --case "<case_id>" --resume "<answer>"
 
-Run (demo auto-answers, still uses LLM unless --mock):
-  uv run library_mastery/deep_research/drafting_deepresearch2.py --demo
+------------------------------------------------------------------------------
+(1) LangGraph node map (what runs, where parallelism happens)
 
-Offline mode (no API key; uses simple mock agents):
-  uv run library_mastery/deep_research/drafting_deepresearch2.py --mock
+Legend:
+  🧠 = LLM node (Structured Outputs, strict)
+  🧩 = deterministic python node
+  ⏸️ = interrupt/HITL
+
+Nodes and flow:
+  🧩 intake_router
+  🧩 ris_builder
+  🧠 validator
+    - if ready_for_planning=false:
+        🧠 question_gen → ⏸️ hitl_interrupt → 🧩 ingest_user_input → back to 🧠 validator
+    - if ready_for_planning=true:
+        🧠 planner → 🧩 research_dispatch → 🧠 researcher_worker (fan-out parallel N tasks) → 🧩 research_join → 🧠 compiler → 🧠 formatter → END
+
+Parallelism:
+  - `researcher_worker` runs N times in parallel in the same superstep (fan-out via Send API).
+  - `research_results` is reducer-backed to aggregate parallel writes safely.
+
+------------------------------------------------------------------------------
+(2) Shared state schema (keys + reducers)
+
+Reducers are mandatory for keys updated by parallel branches (research) and for append-only audit trails (qa_history/debug_log).
+
+See `DraftingState` and reducers:
+  - `qa_history`: reducer=operator.add (append-only)
+  - `research_results`: reducer=merge_research_results (append + safe reorder/dedup in join)
+  - `debug_log`: reducer=operator.add (append-only)
+
+------------------------------------------------------------------------------
+(3) Per-node prompts + strict JSON schemas
+
+LLM nodes (system prompts + Pydantic schemas):
+  - question_gen: `QUESTION_GEN_SYSTEM_PROMPT` + `QuestionGenOut`
+  - validator: `VALIDATOR_SYSTEM_PROMPT` + `ValidatorOut`
+  - planner: `PLANNER_SYSTEM_PROMPT` + `PlannerOut`
+  - researcher_worker: `RESEARCHER_WORKER_SYSTEM_PROMPT` + `ResearcherWorkerOut`
+  - compiler: `COMPILER_SYSTEM_PROMPT` + `CompilerOut`
+  - formatter: `FORMATTER_SYSTEM_PROMPT` + `FormatterOut`
 """
+
+from __future__ import annotations
 
 import hashlib
 import json
+import operator
 import os
 import sys
 import textwrap
@@ -47,7 +76,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from pprint import pformat
-from typing import Any, Annotated, Literal, Optional, TypedDict
+from typing import Any, Literal, Optional, TypedDict, cast
 
 # -----------------------------
 # 0) Bootstrapping for monorepo
@@ -59,12 +88,7 @@ def bootstrap_langgraph_namespace() -> None:
     This repo is a monorepo; `langgraph` is built from multiple `libs/*` folders.
     If you run this script from the repo checkout, we add those libs to sys.path.
     """
-    # file: library_mastery/deep_research/drafting_deepresearch2.py
-    # parents[0] = deep_research
-    # parents[1] = library_mastery
-    # parents[2] = repo root
     repo_root = Path(__file__).resolve().parents[2]
-
     lib_roots = [
         "libs/langgraph",
         "libs/checkpoint",
@@ -72,7 +96,6 @@ def bootstrap_langgraph_namespace() -> None:
         "libs/checkpoint-sqlite",
         "libs/checkpoint-postgres",
     ]
-
     for rel in lib_roots:
         p = repo_root / rel
         if p.exists():
@@ -83,7 +106,7 @@ bootstrap_langgraph_namespace()
 
 
 # -----------------------------
-# 1) External deps (LLM + graph)
+# 1) External deps (graph + schemas)
 # -----------------------------
 
 try:
@@ -94,14 +117,19 @@ except Exception:  # pragma: no cover
         return
 
 
+from typing_extensions import Annotated
+
 from langgraph.constants import END, START
 from langgraph.graph import StateGraph
 from langgraph.runtime import Runtime
 from langgraph.types import Command, Send, interrupt
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
+
+load_dotenv()
+
 
 # -----------------------------
-# 2) Tiny print helpers (simple)
+# 2) UX helpers (terminal)
 # -----------------------------
 
 
@@ -125,7 +153,9 @@ def wrap(text: str) -> str:
     return textwrap.dedent(text).strip()
 
 
-def read_multiline() -> str:
+def read_multiline(prompt: str | None = None) -> str:
+    if prompt:
+        print(prompt)
     print("\nPaste your answer. End with an empty line:")
     lines: list[str] = []
     while True:
@@ -140,12 +170,23 @@ def read_multiline() -> str:
 
 
 # -----------------------------
-# 3) Project identity (fixed)
+# 3) Project identity (current scope)
 # -----------------------------
 
-CATEGORY = "Litigation Drafting"
-SUBCATEGORY = "Civil Pleadings"
-DOC_TYPE = "Plaint"
+# NOTE: This script currently ships with a single RIS for an Indian civil PLAINT.
+# `intake_router` can later be expanded to support other draft types.
+DEFAULT_DRAFT_TYPE = "plaint"
+DEFAULT_LANGUAGE = "en"
+DEFAULT_TONE = "formal"
+DEFAULT_OUTPUT_FORMAT = "plain_text"
+
+ANSWER_MODEL = "gpt-5.1"
+
+
+def require_env(var: str) -> None:
+    if not os.environ.get(var):
+        print(f"Missing environment variable: {var}", file=sys.stderr)
+        sys.exit(1)
 
 
 # -----------------------------
@@ -153,7 +194,7 @@ DOC_TYPE = "Plaint"
 # -----------------------------
 
 SCRIPT_DIR = Path(__file__).resolve().parent
-ARTIFACTS_DIR = SCRIPT_DIR / "_drafting_deepreearch_data"
+ARTIFACTS_DIR = SCRIPT_DIR / "_drafting_deepresearch_data"
 ARTIFACTS_DIR.mkdir(exist_ok=True)
 
 CHECKPOINT_DB = ARTIFACTS_DIR / "checkpoints.db"
@@ -162,417 +203,385 @@ CACHE_DB = ARTIFACTS_DIR / "cache.db"
 
 
 # -----------------------------
-# 5) LLM model settings
+# 5) System prompts (per node)
 # -----------------------------
 
-load_dotenv()
+BASE_RULES = wrap(
+    """
+    You are an assistant in an Indian legal drafting workflow (educational only).
 
-ANSWER_MODEL = "gpt-5.1"
+    Non-negotiable rules:
+    - Do NOT invent facts. Only use the provided slots (facts).
+    - Do NOT provide legal advice; provide drafting-oriented information and structure for lawyer review.
+    - Prefer material facts in pleadings; do not narrate evidence as proof.
+    - Never fabricate citations. If you cannot verify, mark that as needing verification.
+    - Output MUST be valid JSON matching the provided schema exactly. No extra keys. No extra text.
+    """
+)
 
 
-def require_env(var: str) -> None:
-    if not os.environ.get(var):
-        print(f"Missing environment variable: {var}")
-        print("Set it and re-run, or use --mock for offline mode.")
-        sys.exit(1)
+QUESTION_GEN_SYSTEM_PROMPT = wrap(
+    f"""
+    {BASE_RULES}
+
+    You are QUESTION_GEN, an intake-question generator for an Indian legal drafting workflow.
+
+    Goal:
+    - Generate the smallest set of high-impact questions needed to fill missing REQUIRED slots (from RIS) and resolve high-severity contradictions/risk flags.
+    - Ask in batches (max 8 questions per batch).
+    - Prioritize: (1) blocker/required, (2) risk (limitation/jurisdiction/maintainability), (3) quality.
+
+    Rules:
+    - Do NOT invent facts. If information is not present in slots, treat it as unknown.
+    - Each question must map to exactly one canonical slot_key.
+    - Questions must be concise, unambiguous, and answerable in a single message.
+    - Include examples only when it reduces ambiguity (e.g., date formats, party names).
+    """
+)
+
+
+VALIDATOR_SYSTEM_PROMPT = wrap(
+    f"""
+    {BASE_RULES}
+
+    You are VALIDATOR for an Indian legal drafting workflow.
+
+    Goal:
+    - Decide if the state is ready for planning (ready_for_planning=true).
+    - Read RIS (required slots + conditional rules) and current slots.
+    - Produce a validation_report:
+      - missing_required_slots
+      - contradictions (with severity + follow-up slot_key suggestions)
+      - risk_flags (limitation/jurisdiction/maintainability etc.)
+      - assumptions that must be confirmed (only if unavoidable)
+
+    Rules:
+    - Do NOT invent facts; only evaluate what exists in slots.
+    - If any required slot is missing -> ready_for_planning must be false.
+    - If any HIGH severity contradiction exists -> ready_for_planning must be false.
+    - If only risks exist but required slots are complete, ready_for_planning can be true (but include risk_flags).
+    """
+)
+
+
+PLANNER_SYSTEM_PROMPT = wrap(
+    f"""
+    {BASE_RULES}
+
+    You are PLANNER for an Indian legal drafting workflow.
+
+    Goal:
+    - Produce:
+      (1) a draft_plan: ordered sections for the final legal draft
+      (2) research_tasks: parallelizable tasks, each tied to a section_id
+
+    Rules:
+    - Use only information from slots + draft_type + forum/jurisdiction.
+    - Do NOT perform research. Only plan what to research.
+    - Each research task must be atomic, testable, and have clear expected_output.
+    """
+)
+
+
+RESEARCHER_WORKER_SYSTEM_PROMPT = wrap(
+    f"""
+    {BASE_RULES}
+
+    You are RESEARCHER_WORKER for an Indian legal drafting workflow.
+
+    Input:
+    - You receive exactly ONE research_task plus minimal case context (draft_type, forum, jurisdiction, relevant slots).
+
+    Goal:
+    - Return ONE research result for this task, including authorities and a short "application to facts" note.
+
+    Rules:
+    - Do NOT invent authorities/citations. If you do not have access to sources in your toolchain, set needs_verification=true and explain what must be verified.
+    - Prefer primary sources: statutes/rules + binding case-law for the forum/jurisdiction.
+    - Keep outputs concise, structured, and directly usable by the compiler.
+    - This node runs in parallel; it MUST write only to research_results as a list append update.
+    """
+)
+
+
+COMPILER_SYSTEM_PROMPT = wrap(
+    f"""
+    {BASE_RULES}
+
+    You are COMPILER for an Indian legal drafting workflow.
+
+    Goal:
+    - Synthesize ALL research_results into a compiled_bundle aligned to draft_plan.sections.
+    - Remove redundancy, resolve conflicts, and produce:
+      - section_briefs (per section_id)
+      - a deduped authorities_table
+      - conflict_notes (if authorities conflict)
+      - placeholders for missing slots (if any remain)
+
+    Rules:
+    - Do NOT change user facts in slots.
+    - If research is weak/needs verification, preserve that as caveats.
+    """
+)
+
+
+FORMATTER_SYSTEM_PROMPT = wrap(
+    f"""
+    {BASE_RULES}
+
+    You are FORMATTER for an Indian legal drafting workflow.
+
+    Goal:
+    - Render the final_draft as a polished legal draft aligned to draft_plan and compiled_bundle.
+    - Include placeholders (e.g., <<MISSING: slot_key>>) where inputs are missing.
+    - Produce an audit_pack:
+      - facts_used (from slots)
+      - assumptions (from validation_report)
+      - missing_inputs
+      - risk_flags
+      - citations (from compiled_bundle.authorities_table)
+
+    Rules:
+    - Do NOT add new facts.
+    - Keep the draft court-ready in tone and structure.
+    """
+)
 
 
 # -----------------------------
-# 6) Agent prompts (REAL system prompts)
-# -----------------------------
-
-BASE_SYSTEM_PROMPT = wrap(
-    """
-    You are a careful Indian litigation drafting assistant (educational only).
-
-    NON-NEGOTIABLE RULES
-    - Not legal advice. Do not claim to be a lawyer.
-    - Do not hallucinate facts. If missing, ask the user OR use <<PLACEHOLDER: ...>> and surface it in Missing Inputs.
-    - Pleadings must be MATERIAL FACTS (not evidence, not arguments) in numbered paragraphs.
-    - Never fabricate citations (especially case law). If not sure, put it under to_verify with low confidence.
-    - If you cite law, prefer stable procedural sources (CPC/Rules) and state uncertainty as needed.
-    - Output must follow the provided JSON schema exactly (no extra keys).
-    """
-)
-
-QUESTION_GENERATOR_SYSTEM = wrap(
-    f"""
-    {BASE_SYSTEM_PROMPT}
-
-    ROLE: Senior chamber lawyer taking instructions for drafting a civil PLAINT.
-    TASK: Convert the provided expected_keys into a SHORT ranked batch of intake questions.
-
-    IMPORTANT:
-    - Ask ONLY for the provided expected_keys (do not invent new keys).
-    - Keep questions short and practical.
-    - Provide a key for each question so the user can answer in key:value lines.
-    - Add category + priority (blocker/risk/quality/assumption).
-    - After questions, include an "answer_format" instruction.
-    """
-)
-
-
-ANSWER_EXTRACTOR_SYSTEM = wrap(
-    f"""
-    {BASE_SYSTEM_PROMPT}
-
-    ROLE: Case file clerk.
-    TASK: Extract structured facts from the user's answer into the requested keys only.
-
-    IMPORTANT:
-    - Do not guess. If not present, omit the key.
-    - If user explicitly says unknown/blank, include that key in explicitly_unknown.
-    - If user explicitly accepts proceeding with blanks, set proceed_with_blanks=true.
-    - Output must be VALID JSON matching the schema.
-    """
-)
-
-
-DRAFT_PLANNER_SYSTEM = wrap(
-    f"""
-    {BASE_SYSTEM_PROMPT}
-
-    ROLE: Senior associate.
-    TASK: Create the Draft Plan ONLY (structure + pleading strategy) for a civil PLAINT.
-
-    Constraints:
-    - Use only user facts + procedural template requirements (no research content).
-    - Keep it objective, filing-oriented, and India-appropriate.
-    - Output must be VALID JSON matching the schema.
-    """
-)
-
-
-RESEARCH_PLANNER_SYSTEM = wrap(
-    f"""
-    {BASE_SYSTEM_PROMPT}
-
-    ROLE: Research associate.
-    TASK: Produce a Research Plan ONLY (tasks list) for a civil PLAINT in India.
-
-    Constraints:
-    - No drafting text. Only research tasks.
-    - Prefer statutory/procedural hooks. Do NOT invent case citations.
-    - task_id must be unique and stable within this run (T1, T2, ...).
-    - Output must be VALID JSON matching the schema.
-    """
-)
-
-
-RESEARCH_WORKER_SYSTEM = wrap(
-    f"""
-    {BASE_SYSTEM_PROMPT}
-
-    ROLE: Research associate (worker).
-    TASK: Answer ONE research task with traceable findings and citations.
-
-    Constraints:
-    - If you cannot verify a source, mark it in to_verify and keep citations empty or low-confidence.
-    - Do NOT invent case names/citations. Prefer statutes/rules. If unsure, to_verify.
-    - Output must be VALID JSON matching the schema.
-    """
-)
-
-
-COMPILER_SYSTEM = wrap(
-    f"""
-    {BASE_SYSTEM_PROMPT}
-
-    ROLE: Senior drafting counsel (compiler).
-    TASK: Compile case_file + draft_plan + research_pack into a structured draft payload (NO free-form essay).
-
-    Legal/technical constraints:
-    - Enforce pleading discipline: material facts only; do NOT narrate evidence as proof.
-    - If a required field is missing or accepted as blank, use <<PLACEHOLDER: ...>> in the relevant section and include it in missing_inputs.
-    - Use citations ONLY from the provided research_pack.citations (do not invent new citations).
-    - Resolve conflicts and record them as conflicts (do not silently mix contradictory points).
-    - Output must be VALID JSON matching the schema.
-    """
-)
-
-
-# -----------------------------
-# 7) Pydantic schemas (structured outputs)
+# 6) Strict output contracts (Pydantic)
 # -----------------------------
 
 
-class IntakeRouteOut(BaseModel):
-    category: str
-    subcategory: str
-    doc_type: str
-    forum: str
-    jurisdiction_scope: str = Field(default="")
-    notes: str = Field(default="")
+class _StrictModel(BaseModel):
+    model_config = ConfigDict(extra="forbid")
 
 
-class RISField(BaseModel):
-    key: str
+class QuestionGenQuestion(_StrictModel):
+    question_id: str
+    priority: Literal["blocker", "risk", "quality"]
+    slot_key: str
+    question: str
+    expected_answer_format: Literal["free_text", "date_yyyy_mm_dd", "yes_no", "number", "choice", "list"]
+    choices: list[str] = Field(default_factory=list)
+    why_needed: str
+    examples: list[str] = Field(default_factory=list)
+
+
+class QuestionGenBatch(_StrictModel):
+    batch_id: str
+    batch_purpose: str
+    questions: list[QuestionGenQuestion] = Field(min_length=1, max_length=8)
+    user_message: str
+
+
+class QuestionGenOut(_StrictModel):
+    last_question_batch: QuestionGenBatch
+
+
+class ValidatorContradiction(_StrictModel):
+    contradiction_id: str
+    severity: Literal["low", "medium", "high"]
     description: str
-    required: bool = Field(default=True)
-    required_if: Optional[str] = Field(default=None, description="Human-readable condition for when this is required.")
-    data_type: Literal["string", "text", "date", "money", "list", "bool"] = Field(default="string")
-    validation_rules: list[str] = Field(default_factory=list)
-    example: Optional[str] = Field(default=None)
+    slot_keys: list[str] = Field(default_factory=list)
+    suggested_followup_slot_key: str = Field(default="")
 
 
-class RequiredInformationSchemaOut(BaseModel):
-    doc_type: str
-    forum: str
-    mandatory: list[RISField]
-    conditional_mandatory: list[RISField] = Field(default_factory=list)
-    optional: list[RISField] = Field(default_factory=list)
-    evidence_documents_checklist: list[str] = Field(default_factory=list)
-    drafting_guidance: list[str] = Field(default_factory=list)
+class ValidatorRiskFlag(_StrictModel):
+    risk_id: str
+    type: Literal[
+        "limitation",
+        "jurisdiction",
+        "court_fee",
+        "maintainability",
+        "party_capacity",
+        "evidence_gap",
+        "procedural",
+        "other",
+    ]
+    severity: Literal["low", "medium", "high"]
+    description: str
+    mitigation: str = Field(default="")
 
 
-class ValidationReportOut(BaseModel):
-    missing_required_fields: list[str] = Field(default_factory=list)
-    contradictions: list[str] = Field(default_factory=list)
-    risk_flags: list[str] = Field(default_factory=list)
+class ValidatorAssumption(_StrictModel):
+    assumption: str
+    reason: str
+    needs_user_confirmation: bool
+
+
+class ValidationReport(_StrictModel):
+    ready_for_planning: bool
+    missing_required_slots: list[str] = Field(default_factory=list)
+    missing_optional_slots: list[str] = Field(default_factory=list)
+    contradictions: list[ValidatorContradiction] = Field(default_factory=list)
+    risk_flags: list[ValidatorRiskFlag] = Field(default_factory=list)
+    assumptions: list[ValidatorAssumption] = Field(default_factory=list)
+
+
+class ValidatorOut(_StrictModel):
+    validation_report: ValidationReport
+
+
+class PlanSection(_StrictModel):
+    section_id: str
+    order: int
+    title: str
+    purpose: str
+    slot_keys_used: list[str] = Field(default_factory=list)
+    required: bool
+
+
+class PlanStyleGuide(_StrictModel):
+    language: str
+    tone: str
+    numbering: Literal["paragraph", "clause"]
+
+
+class DraftPlan(_StrictModel):
+    plan_id: str
+    sections: list[PlanSection] = Field(min_length=3)
+    style_guide: PlanStyleGuide
+
+
+class ResearchTask(_StrictModel):
+    task_id: str
+    section_id: str
+    priority: Literal["high", "medium", "low"]
+    topic: str
+    jurisdiction_scope: str
+    queries: list[str] = Field(default_factory=list)
+    must_find: list[str] = Field(default_factory=list)
+    expected_output: str
+
+
+class PlannerOut(_StrictModel):
+    draft_plan: DraftPlan
+    research_tasks: list[ResearchTask] = Field(default_factory=list)
+
+
+class ResearchAuthority(_StrictModel):
+    authority_type: Literal["statute", "rule", "case", "notification", "practice_direction", "commentary", "other"]
+    name: str
+    citation: str
+    pinpoint: str = Field(default="")
+    url: str = Field(default="")
+    relevance: str
+
+
+class DraftingSnippet(_StrictModel):
+    section_id: str
+    snippet: str
+    caveat: str = Field(default="")
+
+
+class ResearchResult(_StrictModel):
+    task_id: str
+    topic: str
+    summary: str
+    key_points: list[str] = Field(default_factory=list)
+    authorities: list[ResearchAuthority] = Field(default_factory=list)
+    application_to_facts: str
+    drafting_snippets: list[DraftingSnippet] = Field(default_factory=list)
+    confidence: float
+    needs_verification: bool
+    open_questions: list[str] = Field(default_factory=list)
+
+
+class ResearcherWorkerOut(_StrictModel):
+    research_results: list[ResearchResult] = Field(min_length=1, max_length=1)
+
+
+class CompilerAuthorityRow(_StrictModel):
+    authority_id: str
+    authority_type: str
+    name: str
+    citation: str
+    url: str = Field(default="")
+
+
+class CompilerSectionBrief(_StrictModel):
+    section_id: str
+    legal_position: str
+    drafting_instructions: list[str] = Field(default_factory=list)
+    authority_ids: list[str] = Field(default_factory=list)
+    caveats: list[str] = Field(default_factory=list)
+
+
+class CompilerConflictNote(_StrictModel):
+    conflict_id: str
+    description: str
+    affected_section_ids: list[str] = Field(default_factory=list)
+    resolution_approach: str
+
+
+class CompilerPlaceholder(_StrictModel):
+    slot_key: str
+    placeholder_text: str
+    impact: Literal["low", "medium", "high"]
+
+
+class CompiledBundle(_StrictModel):
+    authorities_table: list[CompilerAuthorityRow] = Field(default_factory=list)
+    section_briefs: list[CompilerSectionBrief] = Field(default_factory=list)
+    conflict_notes: list[CompilerConflictNote] = Field(default_factory=list)
+    placeholders: list[CompilerPlaceholder] = Field(default_factory=list)
+
+
+class CompilerOut(_StrictModel):
+    compiled_bundle: CompiledBundle
+
+
+class AuditFact(_StrictModel):
+    slot_key: str
+    value: str
+
+
+class AuditCitation(_StrictModel):
+    authority_type: str
+    name: str
+    citation: str
+    url: str = Field(default="")
+
+
+class AuditPack(_StrictModel):
+    facts_used: list[AuditFact] = Field(default_factory=list)
     assumptions: list[str] = Field(default_factory=list)
-    ready_for_planning: bool = Field(
-        description="True only when it is objectively safe to proceed to planning (required fields satisfied or explicitly accepted as blanks; no unresolved contradictions)."
-    )
-
-
-class Question(BaseModel):
-    key: str = Field(description="Machine key the user should answer for.")
-    question: str = Field(description="The question to ask the user.")
-    required: bool = Field(default=True)
-    category: Literal["blocker", "risk", "quality", "assumption"] = Field(default="blocker")
-    priority: int = Field(default=1, description="1=highest priority, 3=lowest")
-    example: Optional[str] = Field(default=None)
-
-class QuestionBatchOut(BaseModel):
-    batch_name: str
-    questions: list[Question]
-    expected_keys: list[str]
-    answer_format: str
-
-
-class IntakeExtractOut(BaseModel):
-    updates: dict[str, str] = Field(default_factory=dict)
-    explicitly_unknown: list[str] = Field(default_factory=list)
-    proceed_with_blanks: Optional[bool] = Field(
-        default=None, description="Whether user explicitly accepted proceeding with missing required fields."
-    )
-    what_i_understood: str = Field(default="")
-    still_missing: list[str] = Field(default_factory=list, description="Keys (from expected_keys) not addressed.")
-
-
-class QAEntry(BaseModel):
-    batch: str
-    questions: list[Question] = Field(default_factory=list)
-    answer: str
-    expected_keys: list[str] = Field(default_factory=list)
-    updates: dict[str, str] = Field(default_factory=dict)
-    explicitly_unknown: list[str] = Field(default_factory=list)
-    proceed_with_blanks: Optional[bool] = Field(default=None)
-    what_i_understood: str = Field(default="")
-    still_missing: list[str] = Field(default_factory=list)
-
-
-class DraftPlanOut(BaseModel):
-    issues: list[str] = Field(default_factory=list)
-    outline: list[str] = Field(default_factory=list)
-    pleading_notes: list[str] = Field(default_factory=list)
     missing_inputs: list[str] = Field(default_factory=list)
-
-
-class ResearchTask(BaseModel):
-    task_id: str
-    issue: str
-    research_question: str
-    priority: int = Field(default=2, description="1=highest priority, 3=lowest")
-    expected_authorities: list[str] = Field(default_factory=list)
-
-
-class ResearchPlanOut(BaseModel):
-    tasks: list[ResearchTask] = Field(default_factory=list)
-
-
-class Citation(BaseModel):
-    source_type: Literal["statute", "case", "rule", "treatise", "website", "unknown"] = Field(default="unknown")
-    citation: str = Field(description="Human-readable citation string.")
-    pinpoint: Optional[str] = Field(default=None, description="Optional pinpoint (section/order/rule/para/page).")
-    url: Optional[str] = Field(default=None)
-    note: Optional[str] = Field(default=None)
-    confidence: Literal["high", "medium", "low"] = Field(default="low")
-    verified: bool = Field(default=False, description="True only if citation was verified via a trusted source/tool.")
-
-
-class ResearchResultOut(BaseModel):
-    task_id: str
-    issue: str
-    findings: list[str] = Field(default_factory=list)
-    citations: list[Citation] = Field(default_factory=list)
-    confidence: Literal["high", "medium", "low"] = Field(default="low")
-    conflicts: list[str] = Field(default_factory=list)
-    to_verify: list[str] = Field(default_factory=list)
-
-
-class ResearchPackOut(BaseModel):
-    synthesized_findings: list[str] = Field(default_factory=list)
-    citations: list[Citation] = Field(default_factory=list)
-    unresolved_conflicts: list[str] = Field(default_factory=list)
-    by_task: list[ResearchResultOut] = Field(default_factory=list)
-
-
-class AuditPackOut(BaseModel):
-    facts_as_provided: dict[str, str] = Field(default_factory=dict)
-    blanks_accepted: list[str] = Field(default_factory=list)
-    missing_inputs: list[str] = Field(default_factory=list)
-    contradictions: list[str] = Field(default_factory=list)
     risk_flags: list[str] = Field(default_factory=list)
-    sources: list[Citation] = Field(default_factory=list)
+    citations: list[AuditCitation] = Field(default_factory=list)
 
 
-class CompiledDraftOut(BaseModel):
-    court_name: str = Field(default="")
-    cause_title: str = Field(default="IN THE COURT OF ...")
-    parties: list[str] = Field(default_factory=list)
-    facts_paragraphs: list[str] = Field(default_factory=list)
-    cause_of_action_paragraphs: list[str] = Field(default_factory=list)
-    jurisdiction_paragraphs: list[str] = Field(default_factory=list)
-    limitation_paragraph: str = Field(default="")
-    valuation_paragraph: str = Field(default="")
-    reliefs: list[str] = Field(default_factory=list)
-    interim_reliefs: list[str] = Field(default_factory=list)
-    documents: list[str] = Field(default_factory=list)
-    verification: str = Field(default="")
-    statement_of_truth: Optional[str] = Field(default=None)
-    one_page_brief: str = Field(default="")
-    next_steps: list[str] = Field(default_factory=list)
-    missing_inputs: list[str] = Field(default_factory=list)
-    assumptions_used: list[str] = Field(default_factory=list)
-    risk_flags: list[str] = Field(default_factory=list)
-    citations_used: list[Citation] = Field(default_factory=list)
-    conflict_resolutions: list[str] = Field(
-        default_factory=list,
-        description="If authorities/conflicting positions were encountered, record the resolution reasoning (authority hierarchy) or mark as TO VERIFY.",
-    )
+class FinalOutput(_StrictModel):
+    final_draft: str
+    annexure_list: list[str] = Field(default_factory=list)
+    audit_pack: AuditPack
 
 
-class DraftSection(BaseModel):
-    heading: str
-    body: str
-
-
-class DraftAssemblerOut(BaseModel):
-    cause_title: str
-    parties_block: str
-    sections: list[DraftSection] = Field(default_factory=list)
-    prayer_block: str = Field(default="")
-    annexures: list[str] = Field(default_factory=list)
-    verification: str = Field(default="")
-    statement_of_truth: Optional[str] = Field(default=None)
-    one_page_brief: str = Field(default="")
-    missing_inputs: list[str] = Field(default_factory=list)
-    citations: list[Citation] = Field(default_factory=list)
-    compliance_checklist: list[str] = Field(default_factory=list)
-    next_steps: list[str] = Field(default_factory=list)
-    risk_flags: list[str] = Field(default_factory=list)
-    conflict_resolutions: list[str] = Field(default_factory=list)
-
-
-class FinalDraftPackOut(BaseModel):
-    draft_text: str
-    one_page_brief: str
-    annexures: list[str] = Field(default_factory=list)
-    missing_inputs: list[str] = Field(default_factory=list)
-    citations: list[Citation] = Field(default_factory=list)
-    compliance_checklist: list[str] = Field(default_factory=list)
-    next_steps: list[str] = Field(default_factory=list)
-    audit_pack: AuditPackOut
-
-
-class FinalReviewDecision(BaseModel):
-    approved: bool = Field(default=False)
-    revision_instructions: str = Field(default="")
+class FormatterOut(_StrictModel):
+    final_output: FinalOutput
 
 
 # -----------------------------
-# 8) State (LangGraph)
+# 7) Shared state schema (+ reducers)
 # -----------------------------
 
 
-def append_list(left: list[dict], right: list[dict] | None) -> list[dict]:
-    return left + (right or [])
-
-
-def append_str_list(left: list[str], right: list[str] | None) -> list[str]:
-    return left + (right or [])
-
-
-@dataclass
-class Ctx:
-    case_id: str
-    user_id: str
-
-
-class PlaintState(TypedDict, total=False):
-    category: str
-    subcategory: str
-    doc_type: str
-    forum: str
-    route: dict
-
-    case_file: dict[str, str]
-    blanks: list[str]  # keys user explicitly marked unknown
-    blanks_accepted: list[str]  # keys user explicitly accepted leaving blank (assumptions)
-
-    qa_log: Annotated[list[dict], append_list]
-    log: Annotated[list[str], append_str_list]
-
-    ris: dict
-    validation: dict
-
-    intake_batch: dict
-    last_user_answer: str
-
-    draft_plan: dict
-    research_plan: dict
-    research_results: Annotated[list[dict], append_list]
-    research_pack: dict
-
-    compiled: dict
-    assembled: dict
-    final_draft: dict
-    audit_pack: dict
-
-    final_review: dict
-    revision_count: int
-
-    output_dir: str
-
-
-# -----------------------------
-# 9) Intake definition (plaint-only)
-# -----------------------------
-
-FORUM = "Civil Court (India)"
-MAX_QUESTIONS_PER_BATCH = 6
-
-
-def is_yes(value: str | None) -> bool:
+def is_missing_value(value: object) -> bool:
     if value is None:
+        return True
+    if isinstance(value, str):
+        v = value.strip()
+        if not v:
+            return True
+        if v.lower() in {"[unknown]", "unknown", "[blank]", "blank", "n/a", "na"}:
+            return True
         return False
-    return value.strip().lower() in {"y", "yes", "true", "1"}
-
-
-def is_missing_value(value: str | None) -> bool:
-    if value is None:
-        return True
-    v = value.strip()
-    if not v:
-        return True
-    if v.lower() in {"[blank]", "blank", "unknown", "[unknown]", "n/a", "na"}:
-        return True
     return False
 
 
-def parse_iso_date(text: str | None) -> datetime | None:
-    if not text:
+def parse_iso_date(text: object) -> datetime | None:
+    if not isinstance(text, str):
         return None
     t = text.strip()
     try:
@@ -581,262 +590,225 @@ def parse_iso_date(text: str | None) -> datetime | None:
         return None
 
 
-def build_plaint_ris() -> RequiredInformationSchemaOut:
+def merge_research_results(
+    existing: list[dict[str, Any]],
+    incoming: list[dict[str, Any]] | list[tuple[str, dict[str, Any]]],
+) -> list[dict[str, Any]]:
     """
-    Required Information Schema (RIS) for an Indian civil plaint.
-    This is the contract the intake + validator enforce before planning.
+    Reducer for `research_results`.
+
+    - Worker updates: incoming=[{...}] → append (allow parallel fan-out).
+    - Join updates: incoming=[(task_id, {...}), ...] → upsert by task_id AND reorder by tuple order.
+
+    This pattern avoids INVALID_CONCURRENT_GRAPH_UPDATE in fan-out and still enables stable ordering/dedup.
     """
-    mandatory = [
-        RISField(
-            key="court_name",
-            description="Which court will the plaint be filed in? (name + place)",
-            data_type="string",
-            validation_rules=["Should include court + place."],
-            example="City Civil Court at Bengaluru",
-        ),
-        RISField(
-            key="plaintiff",
-            description="Plaintiff name + description/capacity (e.g., individual/company, age, occupation, address reference).",
-            data_type="text",
-        ),
-        RISField(
-            key="defendant",
-            description="Defendant name + description/capacity (individual/company; include registered office if company).",
-            data_type="text",
-        ),
-        RISField(key="plaintiff_address", description="Plaintiff service address (complete).", data_type="text"),
-        RISField(key="defendant_address", description="Defendant service address (complete).", data_type="text"),
-        RISField(
-            key="facts_timeline",
-            description="Chronological material facts timeline with dates/places (material facts, not evidence).",
-            data_type="text",
-            validation_rules=["Prefer dated lines or numbered paragraphs."],
-        ),
-        RISField(
-            key="cause_of_action",
-            description="Cause of action: what legal wrong occurred and when it arose (material facts).",
-            data_type="text",
-        ),
-        RISField(
-            key="jurisdiction_facts",
-            description="Territorial + pecuniary jurisdiction facts (why this court).",
-            data_type="text",
-        ),
-        RISField(
-            key="reliefs",
-            description="Reliefs/prayers sought (main reliefs; include interim reliefs if any).",
-            data_type="text",
-        ),
-        RISField(
-            key="interim_relief_needed",
-            description="Is any interim/temporary injunction or urgent relief needed? (yes/no/unknown)",
-            data_type="bool",
-            validation_rules=["Answer yes/no/unknown."],
-            example="no",
-        ),
-        RISField(key="valuation", description="Suit valuation for jurisdiction (amount/basis).", data_type="money"),
-        RISField(
-            key="court_fee",
-            description="Court fee position (amount or basis; if unknown, state unknown).",
-            data_type="text",
-        ),
-        RISField(
-            key="limitation",
-            description="Limitation/delay position (why within time; or delay and condonation basis if any).",
-            data_type="text",
-        ),
-        RISField(
-            key="documents",
-            description="List of documents/annexures to rely on (list even if not yet available).",
-            data_type="list",
-        ),
-        RISField(
-            key="is_commercial_dispute",
-            description="Is this a commercial dispute under commercial courts framework? (yes/no/unknown)",
-            data_type="bool",
-            validation_rules=["Answer yes/no/unknown."],
-            example="no",
-        ),
-    ]
+    if not incoming:
+        return existing
 
-    conditional_mandatory = [
-        RISField(
-            key="commercial_value",
-            description="If commercial dispute: specified value/approximate amount (and basis).",
-            required_if="Required if is_commercial_dispute=yes",
-            data_type="money",
-        ),
-        RISField(
-            key="interim_reliefs",
-            description="If interim relief needed: interim relief prayer + urgency reasons (material facts).",
-            required_if="Required if interim_relief_needed=yes",
-            data_type="text",
-        ),
-    ]
+    if isinstance(incoming[0], tuple):  # join-mode upsert + reorder
+        incoming_tuples = cast(list[tuple[str, dict[str, Any]]], incoming)
+        by_id: dict[str, dict[str, Any]] = {}
+        for item in existing:
+            tid = str(item.get("task_id") or "")
+            if tid:
+                by_id[tid] = item
+        ordered: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for tid, payload in incoming_tuples:
+            tid = str(tid)
+            if not tid or tid in seen:
+                continue
+            seen.add(tid)
+            by_id[tid] = payload
+            ordered.append(payload)
+        # Append any leftovers not referenced by join (should be none in normal use).
+        for tid, payload in by_id.items():
+            if tid not in seen:
+                ordered.append(payload)
+        return ordered
 
-    optional = [
-        RISField(
-            key="proposed_filing_date",
-            description="Proposed filing date (YYYY-MM-DD) for basic contradiction checks.",
-            data_type="date",
-            validation_rules=["YYYY-MM-DD."],
-            example="2026-02-02",
-        ),
-        RISField(
-            key="cause_of_action_date",
-            description="If easy to state separately: date cause of action arose (YYYY-MM-DD).",
-            data_type="date",
-            validation_rules=["YYYY-MM-DD."],
-            example="2024-03-01",
-        ),
-    ]
-
-    evidence_documents_checklist = [
-        "Contract/Agreement (if any)",
-        "Invoices / Bills / Statements (if any)",
-        "Demand notice / Legal notice (if any)",
-        "Acknowledgements / Replies (if any)",
-        "Authority documents (Board resolution/POA, if company/agent)",
-        "Court fee computation basis (as applicable)",
-    ]
-
-    drafting_guidance = [
-        "Pleadings: state material facts (not evidence) in numbered paragraphs.",
-        "For plaints, ensure particulars expected in Order VII CPC are covered (court, parties, facts, cause of action, relief, valuation, etc.).",
-        "If commercial dispute, consider statement of truth / affidavit-style verification requirements (varies; TO VERIFY).",
-    ]
-
-    return RequiredInformationSchemaOut(
-        doc_type=DOC_TYPE,
-        forum=FORUM,
-        mandatory=mandatory,
-        conditional_mandatory=conditional_mandatory,
-        optional=optional,
-        evidence_documents_checklist=evidence_documents_checklist,
-        drafting_guidance=drafting_guidance,
-    )
+    # worker-mode append
+    incoming_dicts = cast(list[dict[str, Any]], incoming)
+    return operator.add(existing, incoming_dicts)
 
 
-def _ris_field_map(ris: RequiredInformationSchemaOut) -> dict[str, RISField]:
-    m: dict[str, RISField] = {}
-    for f in ris.mandatory + ris.conditional_mandatory + ris.optional:
-        m[f.key] = f
-    return m
+class DraftingState(TypedDict, total=False):
+    # ---- Identity / request ----
+    user_query: str
+    draft_type: str
+    sub_type: Optional[str]
+    forum: Optional[str]
+    jurisdiction: Optional[str]
+    language: str
+    tone: str
+    output_format: str  # "plain_text" / "markdown" / "docx_ready"
 
+    # ---- Slots/facts store (single source of truth) ----
+    slots: dict[str, Any]
 
-def _conditional_required_keys(ris: RequiredInformationSchemaOut, case_file: dict[str, str]) -> list[str]:
-    keys: list[str] = []
-    if is_yes(case_file.get("is_commercial_dispute")):
-        keys.append("commercial_value")
-    if is_yes(case_file.get("interim_relief_needed")):
-        keys.append("interim_reliefs")
-    return keys
+    # ---- Required information schema (RIS) ----
+    ris: dict[str, Any]
 
+    # ---- Clarification loop ----
+    last_question_batch: dict[str, Any]
+    latest_user_input: str
+    qa_history: Annotated[list[dict[str, Any]], operator.add]
+    clarification_round: int
 
-def validate_case_file(
-    *, ris: RequiredInformationSchemaOut, case_file: dict[str, str], blanks_accepted: list[str]
-) -> ValidationReportOut:
-    field_map = _ris_field_map(ris)
+    # ---- Validation ----
+    validation_report: dict[str, Any]
 
-    required_keys = [f.key for f in ris.mandatory] + _conditional_required_keys(ris, case_file)
-    missing_required: list[str] = []
-    for key in required_keys:
-        if key in blanks_accepted:
-            continue
-        if is_missing_value(case_file.get(key)):
-            desc = field_map.get(key).description if key in field_map else key
-            missing_required.append(f"{key} — {desc}")
+    # ---- Planning ----
+    draft_plan: dict[str, Any]
+    research_tasks: list[dict[str, Any]]
 
-    contradictions: list[str] = []
-    # Basic date sanity checks if user provided structured dates.
-    filing_dt = parse_iso_date(case_file.get("proposed_filing_date"))
-    coa_dt = parse_iso_date(case_file.get("cause_of_action_date"))
-    if filing_dt and coa_dt and coa_dt > filing_dt:
-        contradictions.append("cause_of_action_date is after proposed_filing_date.")
+    # ---- Research (fan-out/fan-in) ----
+    research_results: Annotated[list[dict[str, Any]], merge_research_results]
 
-    risk_flags: list[str] = []
-    if is_missing_value(case_file.get("jurisdiction_facts")):
-        risk_flags.append("Jurisdiction facts unclear (territorial/pecuniary).")
-    if is_missing_value(case_file.get("limitation")):
-        risk_flags.append("Limitation position unclear; risk of time-bar.")
-    if is_missing_value(case_file.get("court_fee")):
-        risk_flags.append("Court fee position unclear; verify applicable court-fee computation.")
-    if is_yes(case_file.get("is_commercial_dispute")) and is_missing_value(case_file.get("commercial_value")):
-        risk_flags.append("Commercial dispute indicated but specified value not provided.")
-    if is_yes(case_file.get("interim_relief_needed")) and is_missing_value(case_file.get("interim_reliefs")):
-        risk_flags.append("Interim relief needed but interim relief details not provided.")
+    # ---- Compilation & final ----
+    compiled_bundle: dict[str, Any]
+    final_output: dict[str, Any]
 
-    # Assumptions are any accepted blanks (explicit user consent).
-    assumptions: list[str] = []
-    for key in blanks_accepted:
-        desc = field_map.get(key).description if key in field_map else key
-        assumptions.append(f"{key} — accepted blank (placeholder) pending confirmation. ({desc})")
-
-    ready_for_planning = len(missing_required) == 0 and len(contradictions) == 0
-    return ValidationReportOut(
-        missing_required_fields=missing_required,
-        contradictions=contradictions,
-        risk_flags=risk_flags,
-        assumptions=assumptions,
-        ready_for_planning=ready_for_planning,
-    )
-
-
-def select_next_question_keys(*, report: ValidationReportOut) -> list[str]:
-    """
-    Deterministic question selection. Rank:
-    1) blockers (missing required + contradictions),
-    2) risk reducers,
-    3) quality improvements (not used yet for plaint-only demo).
-    """
-    keys: list[str] = []
-
-    for entry in report.missing_required_fields:
-        key = entry.split(" — ", 1)[0].strip()
-        if key and key not in keys:
-            keys.append(key)
-
-    # If contradictions mention specific keys, try to include them.
-    if report.contradictions:
-        for c in report.contradictions:
-            # Naive heuristic: add likely keys mentioned in contradiction string.
-            for candidate in ("cause_of_action_date", "proposed_filing_date"):
-                if candidate in c and candidate not in keys:
-                    keys.append(candidate)
-
-    return keys[:MAX_QUESTIONS_PER_BATCH]
+    # ---- Logging ----
+    debug_log: Annotated[list[str], operator.add]
 
 
 # -----------------------------
-# 10) LLM wrapper (with SQLite cache)
+# 8) Context (per run)
+# -----------------------------
+
+
+@dataclass
+class Ctx:
+    case_id: str
+    user_id: str
+
+
+# -----------------------------
+# 9) RIS (deterministic templates)
+# -----------------------------
+
+
+def build_ris(*, draft_type: str, forum: str | None) -> dict[str, Any]:
+    """
+    Deterministic RIS builder.
+
+    This is currently plaint-only (civil).
+    """
+    _ = forum
+    if draft_type != "plaint":
+        # Future: add other RIS templates.
+        draft_type = "plaint"
+
+    required_slots = [
+        "court_name",
+        "plaintiff",
+        "defendant",
+        "plaintiff_address",
+        "defendant_address",
+        "facts_timeline",
+        "cause_of_action",
+        "jurisdiction_facts",
+        "reliefs",
+        "valuation",
+        "court_fee",
+        "limitation",
+        "documents",
+    ]
+
+    conditional_rules = [
+        {
+            "if_slot_key": "interim_relief_needed",
+            "if_equals": "yes",
+            "then_required_slots": ["interim_relief_details"],
+        },
+        {
+            "if_slot_key": "is_commercial_dispute",
+            "if_equals": "yes",
+            "then_required_slots": ["commercial_value"],
+        },
+    ]
+
+    validations = [
+        {"slot_key": "proposed_filing_date", "rule": "date_yyyy_mm_dd"},
+        {"slot_key": "cause_of_action_date", "rule": "date_yyyy_mm_dd"},
+    ]
+
+    return {
+        "draft_type": "plaint",
+        "required_slots": required_slots,
+        "conditional_rules": conditional_rules,
+        "validations": validations,
+        "documents_checklist": [
+            "Contract/Agreement (if any)",
+            "Invoices / Bills / Statements (if any)",
+            "Demand notice / Legal notice (if any)",
+            "Replies / acknowledgements (if any)",
+            "Authority documents (POA/board resolution), if applicable",
+        ],
+        "drafting_guidance": [
+            "Pleadings must contain material facts (not evidence).",
+            "For plaints, cover Order VII CPC particulars (TO VERIFY exact local practice).",
+        ],
+        "slot_descriptions": {
+            "court_name": "Court name + place.",
+            "plaintiff": "Plaintiff description (name/capacity).",
+            "defendant": "Defendant description (name/capacity).",
+            "facts_timeline": "Chronological material facts with dates/places.",
+            "cause_of_action": "What wrong occurred and when it arose (material facts).",
+            "jurisdiction_facts": "Territorial/pecuniary jurisdiction facts.",
+            "reliefs": "Prayers sought (main + interim if any).",
+            "valuation": "Suit valuation (amount/basis).",
+            "court_fee": "Court fee position (amount/basis; if unknown, state unknown).",
+            "limitation": "Limitation position (why within time; or delay explanation).",
+            "documents": "List of documents to rely on (even if not yet available).",
+        },
+    }
+
+
+def compute_missing_required_slots(*, ris: dict[str, Any], slots: dict[str, Any]) -> list[str]:
+    required = [str(x) for x in (ris.get("required_slots") or [])]
+    missing: list[str] = [k for k in required if is_missing_value(slots.get(k))]
+
+    # Apply conditional rules (simple yes/no rules).
+    for rule in ris.get("conditional_rules") or []:
+        if not isinstance(rule, dict):
+            continue
+        if_key = str(rule.get("if_slot_key") or "")
+        if_equals = str(rule.get("if_equals") or "").strip().lower()
+        then_required = [str(x) for x in (rule.get("then_required_slots") or [])]
+        if not if_key or not if_equals:
+            continue
+        actual = str(slots.get(if_key) or "").strip().lower()
+        if actual == if_equals:
+            for k in then_required:
+                if is_missing_value(slots.get(k)) and k not in missing:
+                    missing.append(k)
+    return missing
+
+
+# -----------------------------
+# 10) LLM Engine (Structured Outputs)
 # -----------------------------
 
 
 class LLMEngine:
-    def __init__(self, *, model: str, cache: Optional[object], mock: bool) -> None:
-        self._model = model
+    def __init__(self, *, model: str, cache: Optional[object]) -> None:
+        require_env("OPENAI_API_KEY")
+
+        try:
+            from langchain_openai import ChatOpenAI  # type: ignore
+            from langchain_core.messages import HumanMessage, SystemMessage  # type: ignore
+        except Exception as e:  # pragma: no cover
+            raise RuntimeError(
+                "Missing dependency: langchain-openai / langchain-core. Run via `uv run ...` to install deps."
+            ) from e
+
+        self._llm = ChatOpenAI(model=model, temperature=0)
+        self._SystemMessage = SystemMessage
+        self._HumanMessage = HumanMessage
         self._cache = cache
-        self._mock = mock
-        self._SystemMessage: type | None = None
-        self._HumanMessage: type | None = None
-
-        if not mock:
-            require_env("OPENAI_API_KEY")
-
-        self._llm: object | None = None
-        if not mock:
-            try:
-                from langchain_openai import ChatOpenAI  # type: ignore
-                from langchain_core.messages import HumanMessage, SystemMessage  # type: ignore
-            except Exception as e:  # pragma: no cover
-                raise RuntimeError(
-                    "Missing dependency: langchain-openai / langchain-core. Install them to use real LLM mode, "
-                    "or run with --mock for offline mode."
-                ) from e
-
-            self._llm = ChatOpenAI(model=model, temperature=0)
-            self._SystemMessage = SystemMessage
-            self._HumanMessage = HumanMessage
+        self._model = model
 
     def _cache_key(self, agent: str, system: str, user: str, schema_name: str) -> str:
         h = hashlib.sha256()
@@ -851,1253 +823,663 @@ class LLMEngine:
         h.update(user.encode("utf-8"))
         return h.hexdigest()
 
-    def call_structured(self, *, agent: str, system: str, user: str, schema: type[BaseModel]) -> BaseModel:
-        """
-        Returns an instance of `schema` (Pydantic model).
-        Uses SQLite cache if available.
-        """
-        if self._mock:
-            return self._mock_structured(agent=agent, user=user, schema=schema)
-
+    def call_structured(self, *, agent: str, system: str, user: str, schema: type[_StrictModel]) -> _StrictModel:
+        cache = self._cache
         cache_key = self._cache_key(agent, system, user, schema.__name__)
         ns = ("llm", agent)
-        if self._cache is not None:
-            hit = self._cache.get([(ns, cache_key)]).get((ns, cache_key))
+
+        if cache is not None:
+            hit = cache.get([(ns, cache_key)]).get((ns, cache_key))
             if hit is not None:
                 return schema.model_validate(hit)
-
-        if self._llm is None:
-            raise RuntimeError("LLM is not initialized (mock mode should have returned earlier).")
-        if self._SystemMessage is None or self._HumanMessage is None:
-            raise RuntimeError("Message classes are not initialized (missing langchain-core).")
 
         structured = self._llm.with_structured_output(schema)  # type: ignore[attr-defined]
         out = structured.invoke([self._SystemMessage(content=system), self._HumanMessage(content=user)])
 
-        if self._cache is not None:
-            self._cache.set({(ns, cache_key): (out.model_dump(), 24 * 3600)})
+        if cache is not None:
+            cache.set({(ns, cache_key): (out.model_dump(), 24 * 3600)})
 
         return out
-
-    def _mock_structured(self, *, agent: str, user: str, schema: type[BaseModel]) -> BaseModel:
-        """
-        Offline mode: simple deterministic stubs so the graph can run end-to-end.
-        This is intentionally basic; real behavior happens with the LLM.
-        """
-
-        def extract_json_block(after_marker: str, open_ch: str, close_ch: str) -> str | None:
-            if after_marker not in user:
-                return None
-            tail = user.split(after_marker, 1)[1]
-            start = tail.find(open_ch)
-            if start == -1:
-                return None
-            depth = 0
-            for i in range(start, len(tail)):
-                ch = tail[i]
-                if ch == open_ch:
-                    depth += 1
-                elif ch == close_ch:
-                    depth -= 1
-                    if depth == 0:
-                        return tail[start : i + 1]
-            return None
-
-        def parse_json_list(after_marker: str) -> list[Any]:
-            block = extract_json_block(after_marker, "[", "]")
-            if not block:
-                return []
-            try:
-                val = json.loads(block)
-            except Exception:
-                return []
-            return val if isinstance(val, list) else []
-
-        def parse_json_object(after_marker: str) -> dict[str, Any]:
-            block = extract_json_block(after_marker, "{", "}")
-            if not block:
-                return {}
-            try:
-                val = json.loads(block)
-            except Exception:
-                return {}
-            return val if isinstance(val, dict) else {}
-
-        def parse_user_answer() -> str:
-            if "User answer:" not in user:
-                return ""
-            return user.split("User answer:", 1)[1].strip()
-
-        if schema is QuestionBatchOut:
-            expected = parse_json_list("expected_keys (ask ONLY these keys):") or parse_json_list("expected_keys:")
-            expected_keys = [str(x) for x in expected if isinstance(x, (str, int, float))]
-            questions: list[Question] = []
-            for key in expected_keys:
-                if key == "proceed_with_blanks":
-                    questions.append(
-                        Question(
-                            key=key,
-                            question="If you want to proceed with placeholders for missing required items, answer yes/no.",
-                            required=False,
-                            category="assumption",
-                            priority=1,
-                            example="no",
-                        )
-                    )
-                else:
-                    questions.append(
-                        Question(
-                            key=key,
-                            question=f"Provide {key}.",
-                            required=True,
-                            category="blocker",
-                            priority=1,
-                            example=None,
-                        )
-                    )
-            return QuestionBatchOut(
-                batch_name="Mock intake batch",
-                questions=questions,
-                expected_keys=expected_keys,
-                answer_format="Answer as key: value lines (end with blank line). If unknown, write [UNKNOWN].",
-            )
-
-        if schema is IntakeExtractOut:
-            expected_any = parse_json_list("Expected keys (extract only these keys if present):")
-            expected = [str(x) for x in expected_any if isinstance(x, (str, int, float))]
-            answer_text = parse_user_answer()
-
-            updates: dict[str, str] = {}
-            explicitly_unknown: list[str] = []
-            proceed_with_blanks: Optional[bool] = None
-
-            # Parse key:value lines, keep only expected keys.
-            for line in answer_text.splitlines():
-                if ":" not in line:
-                    continue
-                k, v = line.split(":", 1)
-                k = k.strip()
-                v = v.strip()
-                if k not in expected:
-                    continue
-                if k == "proceed_with_blanks":
-                    vv = v.lower()
-                    if vv in {"y", "yes", "true", "1"}:
-                        proceed_with_blanks = True
-                    elif vv in {"n", "no", "false", "0"}:
-                        proceed_with_blanks = False
-                    continue
-                updates[k] = v
-                if v.lower() in {"blank", "unknown", "[blank]", "[unknown]"}:
-                    explicitly_unknown.append(k)
-
-            understood = "(mock) extracted: " + ", ".join(sorted(list(updates.keys())))
-            still_missing = [k for k in expected if k not in updates]
-            return IntakeExtractOut(
-                updates=updates,
-                explicitly_unknown=explicitly_unknown,
-                proceed_with_blanks=proceed_with_blanks,
-                what_i_understood=understood,
-                still_missing=still_missing,
-            )
-        if schema is DraftPlanOut:
-            return DraftPlanOut(
-                issues=["Jurisdiction", "Limitation", "Reliefs"],
-                outline=["CAUSE TITLE", "FACTS", "CAUSE OF ACTION", "JURISDICTION", "PRAYER", "VERIFICATION"],
-                pleading_notes=[
-                    "Keep pleadings to material facts; list documents separately as annexures.",
-                    "Ensure Order VII plaint particulars are covered (TO VERIFY).",
-                ],
-                missing_inputs=[],
-            )
-        if schema is ResearchPlanOut:
-            return ResearchPlanOut(
-                tasks=[
-                    ResearchTask(
-                        task_id="T1",
-                        issue="Pleading requirements",
-                        research_question="What are the key plaint particulars and pleading discipline points under CPC? (TO VERIFY)",
-                        priority=1,
-                        expected_authorities=["CPC Order VI Rule 2", "CPC Order VII"],
-                    ),
-                    ResearchTask(
-                        task_id="T2",
-                        issue="Limitation",
-                        research_question="Which limitation period likely applies on these facts? (TO VERIFY)",
-                        priority=2,
-                        expected_authorities=["Limitation Act, 1963 (TO VERIFY)"],
-                    ),
-                ]
-            )
-        if schema is ResearchResultOut:
-            task_obj = parse_json_object("Research task (JSON):")
-            task_id = str(task_obj.get("task_id") or "T?")
-            issue = str(task_obj.get("issue") or "Issue")
-            return ResearchResultOut(
-                task_id=task_id,
-                issue=issue,
-                findings=[
-                    "Pleadings should contain material facts and not evidence (TO VERIFY).",
-                    "Plaint should contain particulars required by CPC Order VII (TO VERIFY).",
-                ],
-                citations=[
-                    Citation(
-                        source_type="statute",
-                        citation="Code of Civil Procedure, 1908 (CPC)",
-                        pinpoint="Order VI Rule 2; Order VII (plaint particulars) (TO VERIFY)",
-                        confidence="low",
-                        verified=False,
-                    )
-                ],
-                confidence="low",
-                conflicts=[],
-                to_verify=["Verify exact CPC rule text and local rules."],
-            )
-        if schema is CompiledDraftOut:
-            case_file = parse_json_object("Case file (JSON):")
-            missing_inputs_any = parse_json_list("Missing inputs (placeholders accepted) (JSON list):")
-            missing_inputs = [str(x) for x in missing_inputs_any if isinstance(x, (str, int, float))]
-
-            def as_lines(v: Any) -> list[str]:
-                if v is None:
-                    return []
-                if isinstance(v, list):
-                    return [str(x).strip() for x in v if str(x).strip()]
-                s = str(v).strip()
-                if not s:
-                    return []
-                return [ln.strip() for ln in s.splitlines() if ln.strip()]
-
-            court_name = str(case_file.get("court_name") or "IN THE COURT OF ...").strip()
-            plaintiff = str(case_file.get("plaintiff") or "<<PLACEHOLDER: plaintiff>>").strip()
-            defendant = str(case_file.get("defendant") or "<<PLACEHOLDER: defendant>>").strip()
-            facts = as_lines(case_file.get("facts_timeline")) or ["<<PLACEHOLDER: facts_timeline>>"]
-            reliefs = as_lines(case_file.get("reliefs")) or ["<<PLACEHOLDER: reliefs>>"]
-            docs = as_lines(case_file.get("documents"))
-            return CompiledDraftOut(
-                court_name=court_name,
-                cause_title=f"IN THE COURT OF {court_name}",
-                parties=[f"PLAINTIFF: {plaintiff}", f"DEFENDANT: {defendant}"],
-                facts_paragraphs=facts,
-                cause_of_action_paragraphs=[str(case_file.get("cause_of_action") or "<<PLACEHOLDER: cause_of_action>>")],
-                jurisdiction_paragraphs=[str(case_file.get("jurisdiction_facts") or "<<PLACEHOLDER: jurisdiction_facts>>")],
-                limitation_paragraph=str(case_file.get("limitation") or "<<PLACEHOLDER: limitation>>"),
-                valuation_paragraph=f"Valuation: {case_file.get('valuation', '<<PLACEHOLDER: valuation>>')}. Court fee: {case_file.get('court_fee', '<<PLACEHOLDER: court_fee>>')}.",
-                reliefs=reliefs,
-                interim_reliefs=as_lines(case_file.get("interim_reliefs")),
-                documents=docs,
-                verification="Verified at ____ on ____ that the contents are true to my knowledge (TO VERIFY local form).",
-                statement_of_truth=(
-                    "Statement of Truth / affidavit as applicable (TO VERIFY)."
-                    if str(case_file.get("is_commercial_dispute") or "").strip().lower() in {"y", "yes", "true", "1"}
-                    else None
-                ),
-                one_page_brief="(mock) One-page brief: parties, dispute, reliefs.",
-                next_steps=["(mock) Have an advocate review and finalize court fee/limitation/jurisdiction."],
-                missing_inputs=missing_inputs,
-                assumptions_used=missing_inputs,
-                risk_flags=[],
-                citations_used=[],
-                conflict_resolutions=[],
-            )
-
-        return schema()  # type: ignore[call-arg]
 
 
 ENGINE: LLMEngine | None = None
 
 
 # -----------------------------
-# 11) Agents as LangGraph nodes
+# 11) Graph nodes (contract-driven)
 # -----------------------------
 
 
-def store_put(runtime: Runtime[Ctx], namespace: tuple[str, str], key: str, value: object) -> None:
-    store = getattr(runtime, "store", None)
-    if store is None:
-        return
-    store.put(namespace, key, value)  # type: ignore[union-attr]
+def node_intake_router(state: DraftingState) -> DraftingState:
+    """
+    Reads: user_query
+    Writes: draft_type, forum, jurisdiction, language, tone, output_format, clarification_round, slots (if missing)
+    """
+    user_query = str(state.get("user_query", "") or "").strip()
+    if not user_query:
+        raise ValueError("Missing user_query. Provide an initial user query to start the workflow.")
 
+    draft_type = str(state.get("draft_type") or DEFAULT_DRAFT_TYPE).strip().lower()
+    if not draft_type:
+        draft_type = DEFAULT_DRAFT_TYPE
 
-def node_init(_: PlaintState, runtime: Runtime[Ctx]) -> PlaintState:
-    # Create a persistent namespace for this case in the SQLite store.
-    store_put(
-        runtime,
-        ("cases", runtime.context.case_id),
-        "meta",
-        {"category": CATEGORY, "subcategory": SUBCATEGORY, "doc_type": DOC_TYPE, "forum": FORUM},
-    )
     return {
-        "category": CATEGORY,
-        "subcategory": SUBCATEGORY,
-        "doc_type": DOC_TYPE,
-        "forum": FORUM,
-        "route": {},
-        "ris": {},
-        "validation": {},
-        "intake_batch": {},
-        "last_user_answer": "",
-        "case_file": {},
-        "blanks": [],
-        "blanks_accepted": [],
-        "qa_log": [],
-        "draft_plan": {},
-        "research_plan": {},
+        "user_query": user_query,
+        "draft_type": draft_type,
+        "sub_type": state.get("sub_type"),
+        "forum": state.get("forum"),
+        "jurisdiction": state.get("jurisdiction"),
+        "language": str(state.get("language") or DEFAULT_LANGUAGE),
+        "tone": str(state.get("tone") or DEFAULT_TONE),
+        "output_format": str(state.get("output_format") or DEFAULT_OUTPUT_FORMAT),
+        "slots": dict(state.get("slots") or {}),
+        "qa_history": [],
         "research_results": [],
-        "research_pack": {},
-        "compiled": {},
-        "assembled": {},
-        "final_draft": {},
-        "audit_pack": {},
-        "final_review": {},
-        "revision_count": 0,
-        "log": [f"init(case_id={runtime.context.case_id})"],
+        "clarification_round": int(state.get("clarification_round") or 0),
+        "debug_log": [f"intake_router(draft_type={draft_type})"],
     }
 
 
-def node_intake_router(_: PlaintState, runtime: Runtime[Ctx]) -> PlaintState:
+def node_ris_builder(state: DraftingState) -> DraftingState:
     """
-    Intake Router: classify document type + forum + jurisdiction scope.
-    For this learning script we keep it fixed to plaint, but still emit a typed contract.
+    Reads: draft_type, forum
+    Writes: ris
     """
-    route = IntakeRouteOut(
-        category=CATEGORY,
-        subcategory=SUBCATEGORY,
-        doc_type=DOC_TYPE,
-        forum=FORUM,
-        jurisdiction_scope="India (civil courts) — forum depends on territorial/pecuniary facts (TO VERIFY).",
-        notes="Plaint-only demo router.",
-    )
-    store_put(runtime, ("cases", runtime.context.case_id), "route", route.model_dump())
-    return {"route": route.model_dump(), "forum": route.forum, "log": ["router: classified plaint workflow"]}
+    ris = build_ris(draft_type=str(state.get("draft_type") or DEFAULT_DRAFT_TYPE), forum=state.get("forum"))
+    return {"ris": ris, "debug_log": ["ris_builder(done)"]}
 
 
-def node_ris_builder(_: PlaintState, runtime: Runtime[Ctx]) -> PlaintState:
-    ris = build_plaint_ris()
-    store_put(runtime, ("cases", runtime.context.case_id), "ris", ris.model_dump())
-    return {"ris": ris.model_dump(), "log": ["ris built"]}
-
-
-def node_validator(state: PlaintState, runtime: Runtime[Ctx]) -> PlaintState:
-    ris = RequiredInformationSchemaOut.model_validate(state.get("ris") or build_plaint_ris().model_dump())
-    case_file = dict(state.get("case_file", {}))
-    blanks_accepted = list(state.get("blanks_accepted", []))
-    report = validate_case_file(ris=ris, case_file=case_file, blanks_accepted=blanks_accepted)
-    store_put(runtime, ("cases", runtime.context.case_id), "validation", report.model_dump())
-    return {"validation": report.model_dump(), "log": [f"validated ready={report.ready_for_planning}"]}
-
-
-def route_after_validator(state: PlaintState) -> str:
-    report = ValidationReportOut.model_validate(state.get("validation") or {})
-    return "draft_plan" if report.ready_for_planning else "question_generator"
-
-
-def node_question_generator(state: PlaintState) -> PlaintState:
+def node_validator(state: DraftingState) -> DraftingState:
+    """
+    🧠 Reads: ris, slots, draft_type, forum, jurisdiction
+    🧠 Writes: validation_report
+    """
     if ENGINE is None:
-        raise RuntimeError("LLM engine not initialized. Run() must set ENGINE before executing the graph.")
+        raise RuntimeError("LLM engine not initialized.")
     llm = ENGINE
 
-    ris = RequiredInformationSchemaOut.model_validate(state.get("ris") or build_plaint_ris().model_dump())
-    field_map = _ris_field_map(ris)
-    report = ValidationReportOut.model_validate(state.get("validation") or {})
-    case_file = dict(state.get("case_file", {}))
-
-    expected_keys = select_next_question_keys(report=report)
-
-    # Add risk-reducer (optional) keys if there's room.
-    for candidate in ("cause_of_action_date", "proposed_filing_date"):
-        if len(expected_keys) >= MAX_QUESTIONS_PER_BATCH:
-            break
-        if candidate in expected_keys:
-            continue
-        if is_missing_value(case_file.get(candidate)):
-            expected_keys.append(candidate)
-
-    if report.missing_required_fields and "proceed_with_blanks" not in expected_keys:
-        expected_keys = expected_keys + ["proceed_with_blanks"]
-
-    blocker_keys: set[str] = set()
-    for entry in report.missing_required_fields:
-        k = entry.split(" — ", 1)[0].strip()
-        if k:
-            blocker_keys.add(k)
-
-    expected_desc: list[str] = []
-    for k in expected_keys:
-        if k == "proceed_with_blanks":
-            expected_desc.append(
-                "proceed_with_blanks — If you want to proceed with placeholders for missing required items, answer yes/no."
-            )
-            continue
-        desc = field_map.get(k).description if k in field_map else k
-        expected_desc.append(f"{k} — {desc}")
+    ris = dict(state.get("ris") or {})
+    slots = dict(state.get("slots") or {})
+    draft_type = str(state.get("draft_type") or DEFAULT_DRAFT_TYPE)
+    forum = state.get("forum")
+    jurisdiction = state.get("jurisdiction")
 
     user_prompt = wrap(
         f"""
-        We are drafting a CIVIL PLAINT in India.
-
-        Current case_file (JSON):
-        {json.dumps(case_file, indent=2)}
-
-        Validation report (JSON):
-        {json.dumps(report.model_dump(), indent=2)}
-
-        expected_keys (ask ONLY these keys):
-        {json.dumps(expected_keys, indent=2)}
-
-        Key descriptions:
-        {json.dumps(expected_desc, indent=2)}
-
-        Output a short ranked question batch.
-        """
-    )
-    batch = llm.call_structured(
-        agent="question_generator",
-        system=QUESTION_GENERATOR_SYSTEM,
-        user=user_prompt,
-        schema=QuestionBatchOut,
-    )
-
-    # Enforce deterministic expected_keys and prevent drift: we sanitize LLM output.
-    questions_by_key = {q.key: q for q in batch.questions}
-    sanitized_questions: list[Question] = []
-    for k in expected_keys:
-        q = questions_by_key.get(k)
-        if q is None:
-            q = Question(key=k, question=f"Provide {k}.", required=True)
-        if k == "proceed_with_blanks":
-            sanitized_questions.append(
-                Question(
-                    key=k,
-                    question=q.question or "Proceed with placeholders for missing required items? (yes/no)",
-                    required=False,
-                    category="assumption",
-                    priority=1,
-                    example="no",
-                )
-            )
-        elif k in blocker_keys:
-            sanitized_questions.append(
-                Question(
-                    key=k,
-                    question=q.question or f"Provide {k}.",
-                    required=True,
-                    category="blocker",
-                    priority=1,
-                    example=q.example,
-                )
-            )
-        else:
-            sanitized_questions.append(
-                Question(
-                    key=k,
-                    question=q.question or f"Provide {k}.",
-                    required=False,
-                    category="risk",
-                    priority=2,
-                    example=q.example,
-                )
-            )
-
-    sanitized_batch = QuestionBatchOut(
-        batch_name=batch.batch_name or "Intake questions",
-        questions=sanitized_questions,
-        expected_keys=expected_keys,
-        answer_format=batch.answer_format
-        or "Answer as key: value lines (end with blank line). If unknown, write [UNKNOWN].",
-    )
-    return {"intake_batch": sanitized_batch.model_dump(), "log": [f"questions generated ({len(sanitized_questions)})"]}
-
-
-def node_wait_for_user(state: PlaintState) -> PlaintState:
-    batch = dict(state.get("intake_batch", {}))
-    report = dict(state.get("validation", {}))
-    prompt = {
-        "title": f"Intake — {batch.get('batch_name', 'Questions')}",
-        "questions": batch.get("questions", []),
-        "answer_format": batch.get(
-            "answer_format", "Answer as key: value lines (end with blank line). If unknown, write [UNKNOWN]."
-        ),
-        "missing_required_fields": report.get("missing_required_fields", []),
-        "risk_flags": report.get("risk_flags", []),
-        "note": "Answer in key:value lines. If unknown, write [UNKNOWN]. End with an empty line.",
-    }
-    answer = interrupt(prompt)
-    return {"last_user_answer": str(answer), "log": ["user answered intake batch"]}
-
-
-def _parse_proceed_with_blanks_fallback(answer_text: str) -> Optional[bool]:
-    for line in answer_text.splitlines():
-        if ":" not in line:
-            continue
-        k, v = line.split(":", 1)
-        if k.strip() != "proceed_with_blanks":
-            continue
-        vv = v.strip().lower()
-        if vv in {"y", "yes", "true", "1"}:
-            return True
-        if vv in {"n", "no", "false", "0"}:
-            return False
-    return None
-
-
-def node_answer_extractor(state: PlaintState, runtime: Runtime[Ctx]) -> PlaintState:
-    if ENGINE is None:
-        raise RuntimeError("LLM engine not initialized. Run() must set ENGINE before executing the graph.")
-    llm = ENGINE
-
-    ris = RequiredInformationSchemaOut.model_validate(state.get("ris") or build_plaint_ris().model_dump())
-    field_map = _ris_field_map(ris)
-    report = ValidationReportOut.model_validate(state.get("validation") or {})
-
-    batch = dict(state.get("intake_batch", {}))
-    expected_keys = list(batch.get("expected_keys") or [])
-    answer_text = str(state.get("last_user_answer", "") or "")
-    case_file = dict(state.get("case_file", {}))
-    blanks = list(state.get("blanks", []))
-    blanks_accepted = list(state.get("blanks_accepted", []))
-
-    expected_desc: list[str] = []
-    for k in expected_keys:
-        if k == "proceed_with_blanks":
-            expected_desc.append(
-                "proceed_with_blanks — If you want to proceed with placeholders for missing required items, answer yes/no."
-            )
-            continue
-        desc = field_map.get(k).description if k in field_map else k
-        expected_desc.append(f"{k} — {desc}")
-
-    extract_user_prompt = wrap(
-        f"""
-        We are drafting a CIVIL PLAINT.
-
-        Expected keys (extract only these keys if present):
-        {json.dumps(expected_keys, indent=2)}
-
-        Key descriptions:
-        {json.dumps(expected_desc, indent=2)}
-
-        Existing case_file (JSON):
-        {json.dumps(case_file, indent=2)}
-
-        User answer:
-        {answer_text}
-        """
-    )
-    extracted = llm.call_structured(
-        agent="answer_extractor",
-        system=ANSWER_EXTRACTOR_SYSTEM,
-        user=extract_user_prompt,
-        schema=IntakeExtractOut,
-    )
-
-    allowed_case_keys = set(expected_keys) - {"proceed_with_blanks"}
-    extracted_updates = {k: v for k, v in extracted.updates.items() if k in allowed_case_keys}
-    extracted_unknowns = [k for k in extracted.explicitly_unknown if k in allowed_case_keys]
-
-    # Apply updates
-    for k, v in extracted_updates.items():
-        if isinstance(v, str) and v.strip():
-            case_file[k] = v.strip()
-            if k in blanks:
-                blanks.remove(k)
-            if k in blanks_accepted:
-                blanks_accepted.remove(k)
-
-    for k in extracted_unknowns:
-        if k not in blanks:
-            blanks.append(k)
-
-    proceed = extracted.proceed_with_blanks
-    if proceed is None:
-        proceed = _parse_proceed_with_blanks_fallback(answer_text)
-
-    if proceed:
-        for entry in report.missing_required_fields:
-            k = entry.split(" — ", 1)[0].strip()
-            if k and k not in blanks_accepted:
-                blanks_accepted.append(k)
-
-    store_put(runtime, ("cases", runtime.context.case_id), "case_file", case_file)
-    store_put(runtime, ("cases", runtime.context.case_id), "blanks", {"blanks": blanks, "blanks_accepted": blanks_accepted})
-
-    qa = QAEntry(
-        batch=str(batch.get("batch_name", "") or ""),
-        questions=[Question.model_validate(q) for q in (batch.get("questions", []) or [])],
-        answer=answer_text,
-        expected_keys=expected_keys,
-        updates=extracted_updates,
-        explicitly_unknown=extracted_unknowns,
-        proceed_with_blanks=bool(proceed) if proceed is not None else None,
-        what_i_understood=extracted.what_i_understood,
-        still_missing=list(extracted.still_missing or []),
-    )
-
-    return {
-        "case_file": case_file,
-        "blanks": blanks,
-        "blanks_accepted": blanks_accepted,
-        "qa_log": [qa.model_dump()],
-        "log": [f"intake applied updates={list(extracted_updates.keys())} proceed_with_blanks={proceed}"],
-    }
-
-
-def node_draft_plan(state: PlaintState, runtime: Runtime[Ctx]) -> PlaintState:
-    if ENGINE is None:
-        raise RuntimeError("LLM engine not initialized. Run() must set ENGINE before executing the graph.")
-    llm = ENGINE
-
-    case_file = dict(state.get("case_file", {}))
-    ris = dict(state.get("ris", {}))
-    report = dict(state.get("validation", {}))
-    user_prompt = wrap(
-        f"""
-        Category: {CATEGORY}
-        Subcategory: {SUBCATEGORY}
-        Type: {DOC_TYPE}
+        draft_type: {draft_type}
+        forum: {forum if forum else ""}
+        jurisdiction: {jurisdiction if jurisdiction else ""}
 
         RIS (JSON):
         {json.dumps(ris, indent=2)}
 
-        Validation report (JSON):
-        {json.dumps(report, indent=2)}
-
-        Case file (JSON):
-        {json.dumps(case_file, indent=2)}
+        slots (JSON):
+        {json.dumps(slots, indent=2)}
         """
     )
-    out = llm.call_structured(agent="draft_planner", system=DRAFT_PLANNER_SYSTEM, user=user_prompt, schema=DraftPlanOut)
-    store_put(runtime, ("cases", runtime.context.case_id), "draft_plan", out.model_dump())
-    return {"draft_plan": out.model_dump(), "log": ["draft plan created"]}
 
+    out = cast(ValidatorOut, llm.call_structured(agent="validator", system=VALIDATOR_SYSTEM_PROMPT, user=user_prompt, schema=ValidatorOut))
 
-def node_research_plan(state: PlaintState, runtime: Runtime[Ctx]) -> PlaintState:
-    if ENGINE is None:
-        raise RuntimeError("LLM engine not initialized. Run() must set ENGINE before executing the graph.")
-    llm = ENGINE
-
-    case_file = dict(state.get("case_file", {}))
-    draft_plan = dict(state.get("draft_plan", {}))
-    user_prompt = wrap(
-        f"""
-        Case file (JSON):
-        {json.dumps(case_file, indent=2)}
-
-        Draft plan (JSON):
-        {json.dumps(draft_plan, indent=2)}
-
-        Output a research plan with task_id values like T1, T2, ... (unique).
-        """
-    )
-    out = llm.call_structured(
-        agent="research_planner",
-        system=RESEARCH_PLANNER_SYSTEM,
-        user=user_prompt,
-        schema=ResearchPlanOut,
-    )
-    store_put(runtime, ("cases", runtime.context.case_id), "research_plan", out.model_dump())
-    # Reset map-reduce accumulators for this run segment.
-    return {"research_plan": out.model_dump(), "research_results": [], "research_pack": {}, "log": ["research plan created"]}
-
-
-def route_to_research_workers(state: PlaintState) -> list[Send] | str:
-    plan = dict(state.get("research_plan", {}))
-    tasks = plan.get("tasks", []) or []
-    if not tasks:
-        return "research_reduce"
-
-    case_file = dict(state.get("case_file", {}))
-    draft_plan = dict(state.get("draft_plan", {}))
-    ris = dict(state.get("ris", {}))
-    return [
-        Send(
-            "research_worker",
-            {"task": t, "case_file": case_file, "draft_plan": draft_plan, "ris": ris},
-        )
-        for t in tasks
-    ]
-
-
-def node_research_worker(state: dict[str, Any]) -> PlaintState:
-    if ENGINE is None:
-        raise RuntimeError("LLM engine not initialized. Run() must set ENGINE before executing the graph.")
-    llm = ENGINE
-
-    task = ResearchTask.model_validate(state.get("task") or {})
-    case_file = state.get("case_file") or {}
-    draft_plan = state.get("draft_plan") or {}
-    ris = state.get("ris") or {}
-
-    user_prompt = wrap(
-        f"""
-        Research task (JSON):
-        {json.dumps(task.model_dump(), indent=2)}
-
-        Case file (JSON):
-        {json.dumps(case_file, indent=2)}
-
-        Draft plan (JSON):
-        {json.dumps(draft_plan, indent=2)}
-
-        RIS (JSON):
-        {json.dumps(ris, indent=2)}
-        """
-    )
-    out = llm.call_structured(
-        agent="research_worker",
-        system=RESEARCH_WORKER_SYSTEM,
-        user=user_prompt,
-        schema=ResearchResultOut,
-    )
-    # Enforce task identity (prevents drift across fan-out workers).
-    if out.task_id != task.task_id or out.issue != task.issue:
-        out = out.model_copy(update={"task_id": task.task_id, "issue": task.issue})
-    return {"research_results": [out.model_dump()], "log": [f"research done {out.task_id}"]}
-
-
-def node_research_reduce(state: PlaintState, runtime: Runtime[Ctx]) -> PlaintState:
-    results_raw = list(state.get("research_results", []) or [])
-    results: list[ResearchResultOut] = []
-    citations: list[Citation] = []
-    conflicts: list[str] = []
-    synthesized: list[str] = []
-
-    for r in results_raw:
-        rr = ResearchResultOut.model_validate(r)
-        results.append(rr)
-        synthesized.extend([f"[{rr.task_id}] {f}" for f in rr.findings])
-        conflicts.extend(rr.conflicts)
-        citations.extend(rr.citations)
-
-    # Deduplicate citations (best-effort).
-    seen: set[tuple[str, str, str | None, str | None]] = set()
-    deduped: list[Citation] = []
-    for c in citations:
-        key = (c.source_type, c.citation.strip(), (c.pinpoint or "").strip() or None, (c.url or "").strip() or None)
-        if key in seen:
-            continue
-        seen.add(key)
-        deduped.append(c)
-
-    pack = ResearchPackOut(
-        synthesized_findings=synthesized,
-        citations=deduped,
-        unresolved_conflicts=conflicts,
-        by_task=results,
-    )
-    store_put(runtime, ("cases", runtime.context.case_id), "research_pack", pack.model_dump())
-    return {"research_pack": pack.model_dump(), "log": [f"research reduced tasks={len(results)}"]}
-
-
-def node_compiler(state: PlaintState, runtime: Runtime[Ctx]) -> PlaintState:
-    if ENGINE is None:
-        raise RuntimeError("LLM engine not initialized. Run() must set ENGINE before executing the graph.")
-    llm = ENGINE
-
-    ris = RequiredInformationSchemaOut.model_validate(state.get("ris") or build_plaint_ris().model_dump())
-    field_map = _ris_field_map(ris)
-
-    case_file = dict(state.get("case_file", {}))
-    blanks_accepted = list(state.get("blanks_accepted", []))
-    report = dict(state.get("validation", {}))
-    draft_plan = dict(state.get("draft_plan", {}))
-    research_pack = dict(state.get("research_pack", {}))
-    final_review = dict(state.get("final_review", {}))
-
-    # For accepted blanks, inject explicit placeholders so the compiler can't "fill in" by guessing.
-    cf_for_compiler = dict(case_file)
-    missing_inputs: list[str] = []
-    for key in blanks_accepted:
-        desc = field_map.get(key).description if key in field_map else key
-        placeholder = f"<<PLACEHOLDER: {key} — {desc}>>"
-        if is_missing_value(cf_for_compiler.get(key)):
-            cf_for_compiler[key] = placeholder
-        missing_inputs.append(f"{key} — {desc}")
-
-    revision_instructions = str(final_review.get("revision_instructions", "") or "").strip()
-    user_prompt = wrap(
-        f"""
-        Case file (JSON):
-        {json.dumps(cf_for_compiler, indent=2)}
-
-        Missing inputs (placeholders accepted) (JSON list):
-        {json.dumps(missing_inputs, indent=2)}
-
-        Validation report (JSON):
-        {json.dumps(report, indent=2)}
-
-        Draft plan (JSON):
-        {json.dumps(draft_plan, indent=2)}
-
-        Research pack (JSON):
-        {json.dumps(research_pack, indent=2)}
-
-        Revision instructions (if any):
-        {revision_instructions if revision_instructions else "(none)"}
-        """
-    )
-    out = llm.call_structured(
-        agent="compiler",
-        system=COMPILER_SYSTEM,
-        user=user_prompt,
-        schema=CompiledDraftOut,
-    )
-    # Enforce "audit pack" invariants deterministically (prevents silent omission).
-    merged_missing_inputs: list[str] = []
-    for item in list(out.missing_inputs or []) + missing_inputs:
-        s = str(item).strip()
-        if s and s not in merged_missing_inputs:
-            merged_missing_inputs.append(s)
-
-    report_risk_flags = [str(x).strip() for x in (report.get("risk_flags", []) or []) if str(x).strip()]
-    merged_risk_flags: list[str] = []
-    for item in report_risk_flags + list(out.risk_flags or []):
-        s = str(item).strip()
-        if s and s not in merged_risk_flags:
-            merged_risk_flags.append(s)
-
-    allowed_citations: list[Citation] = [
-        Citation.model_validate(c) for c in (research_pack.get("citations", []) or []) if isinstance(c, dict)
-    ]
-    allowed_keys = {
-        (c.source_type, c.citation.strip(), (c.pinpoint or "").strip(), (c.url or "").strip()) for c in allowed_citations
-    }
-
-    filtered_used: list[Citation] = []
-    for c in out.citations_used or []:
-        key = (c.source_type, c.citation.strip(), (c.pinpoint or "").strip(), (c.url or "").strip())
-        if key in allowed_keys:
-            filtered_used.append(c)
-
-    # Fill obvious defaults from the case file.
-    court_name = out.court_name.strip() or str(case_file.get("court_name") or "").strip()
-    cause_title = out.cause_title.strip()
-    if (not cause_title or cause_title == "IN THE COURT OF ...") and court_name:
-        cause_title = f"IN THE COURT OF {court_name}"
-
-    out = out.model_copy(
+    # Deterministic safety: never allow "ready" if required slots are missing.
+    missing_required = compute_missing_required_slots(ris=ris, slots=slots)
+    report = out.validation_report.model_copy(
         update={
-            "court_name": court_name,
-            "cause_title": cause_title or out.cause_title,
-            "missing_inputs": merged_missing_inputs,
-            "assumptions_used": merged_missing_inputs,
-            "risk_flags": merged_risk_flags,
-            "citations_used": filtered_used,
+            "missing_required_slots": sorted(set(list(out.validation_report.missing_required_slots) + missing_required)),
         }
     )
-    store_put(runtime, ("cases", runtime.context.case_id), "compiled", out.model_dump())
-    return {"compiled": out.model_dump(), "log": ["compiled draft payload created"]}
+
+    if report.missing_required_slots:
+        report = report.model_copy(update={"ready_for_planning": False})
+
+    if any(c.severity == "high" for c in report.contradictions):
+        report = report.model_copy(update={"ready_for_planning": False})
+
+    return {"validation_report": report.model_dump(), "debug_log": [f"validator(ready={report.ready_for_planning})"]}
 
 
-def _render_numbered(paras: list[str], start: int = 1) -> str:
-    lines: list[str] = []
-    n = start
-    for p in paras:
-        t = str(p).strip()
-        if not t:
-            continue
-        lines.append(f"{n}. {t}")
-        n += 1
-    return "\n".join(lines).strip()
+def route_after_validator(state: DraftingState) -> str:
+    report = dict(state.get("validation_report") or {})
+    ready = bool(report.get("ready_for_planning"))
+    return "planner" if ready else "question_gen"
 
 
-def _render_bullets(items: list[str]) -> str:
-    return "\n".join([f"- {str(x).strip()}" for x in items if str(x).strip()]).strip()
+def node_question_gen(state: DraftingState) -> DraftingState:
+    """
+    🧠 Reads: user_query, draft_type, ris, slots, validation_report
+    🧠 Writes: last_question_batch
+    """
+    if ENGINE is None:
+        raise RuntimeError("LLM engine not initialized.")
+    llm = ENGINE
 
+    user_query = str(state.get("user_query") or "")
+    draft_type = str(state.get("draft_type") or DEFAULT_DRAFT_TYPE)
+    ris = dict(state.get("ris") or {})
+    slots = dict(state.get("slots") or {})
+    validation_report = dict(state.get("validation_report") or {})
+    clarification_round = int(state.get("clarification_round") or 0)
 
-def _build_compliance_checklist(
-    *, ris: RequiredInformationSchemaOut, case_file: dict[str, str], blanks_accepted: list[str]
-) -> list[str]:
-    field_map = _ris_field_map(ris)
-    required_keys = [f.key for f in ris.mandatory] + _conditional_required_keys(ris, case_file)
-    lines: list[str] = []
-    for key in required_keys:
-        desc = field_map.get(key).description if key in field_map else key
-        if key in blanks_accepted:
-            lines.append(f"PLACEHOLDER ACCEPTED: {key} — {desc}")
-            continue
-        if is_missing_value(case_file.get(key)):
-            lines.append(f"MISSING: {key} — {desc}")
-        else:
-            lines.append(f"OK: {key}")
-    return lines
+    user_prompt = wrap(
+        f"""
+        user_query:
+        {user_query}
 
+        draft_type: {draft_type}
 
-def node_assembler(state: PlaintState, runtime: Runtime[Ctx]) -> PlaintState:
-    compiled = CompiledDraftOut.model_validate(state.get("compiled") or {})
-    case_file = dict(state.get("case_file", {}))
-    blanks_accepted = list(state.get("blanks_accepted", []))
-    ris = RequiredInformationSchemaOut.model_validate(state.get("ris") or build_plaint_ris().model_dump())
+        RIS (JSON):
+        {json.dumps(ris, indent=2)}
 
-    parties_block = ""
-    if compiled.parties:
-        parties_block = "\n".join([str(x).strip() for x in compiled.parties if str(x).strip()])
-    else:
-        p = case_file.get("plaintiff", "<<PLACEHOLDER: plaintiff>>")
-        d = case_file.get("defendant", "<<PLACEHOLDER: defendant>>")
-        parties_block = f"Plaintiff: {p}\nDefendant: {d}"
+        slots (JSON):
+        {json.dumps(slots, indent=2)}
 
-    sections: list[DraftSection] = []
-    sections.append(DraftSection(heading="FACTS (MATERIAL FACTS)", body=_render_numbered(compiled.facts_paragraphs)))
-    sections.append(DraftSection(heading="CAUSE OF ACTION", body=_render_numbered(compiled.cause_of_action_paragraphs)))
-    sections.append(DraftSection(heading="JURISDICTION", body=_render_numbered(compiled.jurisdiction_paragraphs)))
-    if compiled.limitation_paragraph.strip():
-        sections.append(DraftSection(heading="LIMITATION", body=compiled.limitation_paragraph.strip()))
-    if compiled.valuation_paragraph.strip():
-        sections.append(DraftSection(heading="VALUATION AND COURT FEE", body=compiled.valuation_paragraph.strip()))
-
-    prayer_lines: list[str] = []
-    if compiled.reliefs:
-        prayer_lines.append("Main reliefs:")
-        prayer_lines.append(_render_bullets(compiled.reliefs))
-    if compiled.interim_reliefs:
-        prayer_lines.append("\nInterim reliefs (if any):")
-        prayer_lines.append(_render_bullets(compiled.interim_reliefs))
-    prayer_block = "\n".join([x for x in prayer_lines if x.strip()]).strip()
-
-    compliance = _build_compliance_checklist(ris=ris, case_file=case_file, blanks_accepted=blanks_accepted)
-
-    assembled = DraftAssemblerOut(
-        cause_title=compiled.cause_title or "IN THE COURT OF ...",
-        parties_block=parties_block,
-        sections=sections,
-        prayer_block=prayer_block,
-        annexures=list(compiled.documents or []),
-        verification=compiled.verification or "",
-        statement_of_truth=compiled.statement_of_truth,
-        one_page_brief=compiled.one_page_brief or "",
-        missing_inputs=list(compiled.missing_inputs or []),
-        citations=list(compiled.citations_used or []),
-        compliance_checklist=compliance,
-        next_steps=list(compiled.next_steps or []),
-        risk_flags=list(compiled.risk_flags or []),
-        conflict_resolutions=list(compiled.conflict_resolutions or []),
+        validation_report (JSON):
+        {json.dumps(validation_report, indent=2)}
+        """
     )
-    store_put(runtime, ("cases", runtime.context.case_id), "assembled", assembled.model_dump())
-    return {"assembled": assembled.model_dump(), "log": ["assembled template sections"]}
-
-
-def node_formatter(state: PlaintState, runtime: Runtime[Ctx]) -> PlaintState:
-    assembled = DraftAssemblerOut.model_validate(state.get("assembled") or {})
-    case_file = dict(state.get("case_file", {}))
-    blanks_accepted = list(state.get("blanks_accepted", []))
-    report = dict(state.get("validation", {}))
-
-    draft_lines: list[str] = []
-    draft_lines.append(assembled.cause_title.strip())
-    if case_file.get("court_name"):
-        draft_lines.append(str(case_file.get("court_name")).strip())
-    draft_lines.append("")
-    draft_lines.append("CIVIL SUIT NO. ____ OF 20__")
-    draft_lines.append("")
-    draft_lines.append("BETWEEN")
-    draft_lines.append(assembled.parties_block.strip())
-    draft_lines.append("")
-    draft_lines.append("PLAINT")
-    draft_lines.append("")
-    draft_lines.append("MOST RESPECTFULLY SHOWETH:")
-    draft_lines.append("")
-
-    for s in assembled.sections:
-        draft_lines.append(s.heading.strip())
-        draft_lines.append(s.body.strip())
-        draft_lines.append("")
-
-    draft_lines.append("PRAYER")
-    draft_lines.append(assembled.prayer_block.strip())
-    draft_lines.append("")
-
-    if assembled.annexures:
-        draft_lines.append("LIST OF DOCUMENTS / ANNEXURES")
-        draft_lines.append(_render_bullets(assembled.annexures))
-        draft_lines.append("")
-
-    if assembled.verification.strip():
-        draft_lines.append("VERIFICATION")
-        draft_lines.append(assembled.verification.strip())
-        draft_lines.append("")
-
-    if assembled.statement_of_truth and assembled.statement_of_truth.strip():
-        draft_lines.append("STATEMENT OF TRUTH / AFFIDAVIT (AS APPLICABLE)")
-        draft_lines.append(assembled.statement_of_truth.strip())
-        draft_lines.append("")
-
-    draft_text = "\n".join(draft_lines).rstrip() + "\n"
-
-    audit = AuditPackOut(
-        facts_as_provided={k: str(v) for k, v in case_file.items()},
-        blanks_accepted=blanks_accepted,
-        missing_inputs=list(assembled.missing_inputs or []),
-        contradictions=list(report.get("contradictions", []) or []),
-        risk_flags=list(report.get("risk_flags", []) or []),
-        sources=list(assembled.citations or []),
+    out = cast(
+        QuestionGenOut,
+        llm.call_structured(agent="question_gen", system=QUESTION_GEN_SYSTEM_PROMPT, user=user_prompt, schema=QuestionGenOut),
     )
 
-    final_pack = FinalDraftPackOut(
-        draft_text=draft_text,
-        one_page_brief=assembled.one_page_brief or "",
-        annexures=list(assembled.annexures or []),
-        missing_inputs=list(assembled.missing_inputs or []),
-        citations=list(assembled.citations or []),
-        compliance_checklist=list(assembled.compliance_checklist or []),
-        next_steps=list(assembled.next_steps or []),
-        audit_pack=audit,
+    # Enforce allowed slot keys deterministically (prevents drift).
+    missing_required = [str(x) for x in (validation_report.get("missing_required_slots") or [])]
+    allowed: set[str] = set(missing_required)
+    for c in validation_report.get("contradictions", []) or []:
+        if isinstance(c, dict):
+            for k in c.get("slot_keys", []) or []:
+                allowed.add(str(k))
+            follow = str(c.get("suggested_followup_slot_key") or "").strip()
+            if follow:
+                allowed.add(follow)
+
+    filtered_questions: list[QuestionGenQuestion] = []
+    for q in out.last_question_batch.questions:
+        if q.slot_key in allowed:
+            filtered_questions.append(q)
+        if len(filtered_questions) >= 8:
+            break
+
+    # If the LLM returned nothing usable, fall back to required-missing keys.
+    if not filtered_questions and missing_required:
+        filtered_questions = [
+            QuestionGenQuestion(
+                question_id=f"q_{k}",
+                priority="blocker",
+                slot_key=k,
+                question=f"Provide {k}.",
+                expected_answer_format="free_text",
+                why_needed="Required for drafting.",
+                choices=[],
+                examples=[],
+            )
+            for k in missing_required[:8]
+        ]
+
+    batch_id = out.last_question_batch.batch_id.strip() or f"batch_{clarification_round + 1}"
+    batch_purpose = out.last_question_batch.batch_purpose.strip() or "Fill missing required inputs."
+
+    # Deterministic user_message for interactive lawyers (key:value lines).
+    keys_list = "\n".join([f"- {q.slot_key}: {q.question}" for q in filtered_questions])
+    user_message = wrap(
+        f"""
+        Please answer the following in key:value lines (one per line). If unknown, write [UNKNOWN].
+
+        Questions:
+        {keys_list}
+        """
     )
 
-    store_put(runtime, ("cases", runtime.context.case_id), "final_draft", final_pack.model_dump())
-    store_put(runtime, ("cases", runtime.context.case_id), "audit_pack", audit.model_dump())
-    return {"final_draft": final_pack.model_dump(), "audit_pack": audit.model_dump(), "log": ["formatted final draft"]}
+    batch = out.last_question_batch.model_copy(
+        update={
+            "batch_id": batch_id,
+            "batch_purpose": batch_purpose,
+            "questions": filtered_questions,
+            "user_message": user_message,
+        }
+    )
+
+    return {"last_question_batch": batch.model_dump(), "debug_log": [f"question_gen(n={len(filtered_questions)})"]}
 
 
-def node_final_review(state: PlaintState) -> PlaintState:
-    final_pack = dict(state.get("final_draft", {}))
-    one_page_brief = str(final_pack.get("one_page_brief", "") or "").strip()
-    missing_inputs = final_pack.get("missing_inputs", []) or []
-    risk_flags = (state.get("validation") or {}).get("risk_flags", []) if isinstance(state.get("validation"), dict) else []
-
-    preview = str(final_pack.get("draft_text", "") or "")
-    preview = preview[:1200] + ("\n...\n" if len(preview) > 1200 else "")
-
+def node_hitl_interrupt(state: DraftingState) -> DraftingState:
+    """
+    ⏸️ Reads: last_question_batch
+    ⏸️ Writes: latest_user_input (resume payload)
+    """
+    batch = dict(state.get("last_question_batch") or {})
     prompt = {
-        "title": "Final Review (HITL)",
-        "one_page_brief": one_page_brief,
-        "missing_inputs": missing_inputs,
-        "risk_flags": risk_flags,
-        "draft_preview": preview,
-        "instructions": wrap(
-            """
-            Reply with:
-              approved: yes
-            OR:
-              approved: no
-              revision_instructions: <what to change>
-
-            If you reply without 'approved: yes', the text will be treated as revision instructions.
-            """
-        ),
+        "title": "Clarifying questions",
+        "batch_id": batch.get("batch_id"),
+        "batch_purpose": batch.get("batch_purpose"),
+        "user_message": batch.get("user_message"),
+        "questions": batch.get("questions", []),
+        "answer_format": "Answer as key: value lines. End with an empty line.",
+        "note": "Do not include sensitive personal identifiers. Use [UNKNOWN] if unknown.",
     }
     answer = interrupt(prompt)
-    text = str(answer).strip()
+    return {"latest_user_input": str(answer)}
 
-    approved = False
-    revision_instructions = ""
-    for line in text.splitlines():
-        if ":" not in line:
+
+def _parse_kv_lines(text: str) -> dict[str, str]:
+    out: dict[str, str] = {}
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or ":" not in line:
             continue
         k, v = line.split(":", 1)
-        if k.strip() == "approved" and is_yes(v):
-            approved = True
-        if k.strip() == "revision_instructions":
-            revision_instructions = v.strip()
-
-    if not approved and not revision_instructions:
-        revision_instructions = text
-
-    decision = FinalReviewDecision(approved=approved, revision_instructions=revision_instructions)
-    return {"final_review": decision.model_dump(), "log": [f"final_review approved={approved}"]}
+        k = k.strip()
+        v = v.strip()
+        if k:
+            out[k] = v
+    return out
 
 
-def route_after_final_review(state: PlaintState) -> str:
-    decision = FinalReviewDecision.model_validate(state.get("final_review") or {})
-    revision_count = int(state.get("revision_count") or 0)
-    if decision.approved:
-        return "deliver"
-    if decision.revision_instructions.strip() and revision_count < 2:
-        return "compiler"
-    return "final_review"
+def node_ingest_user_input(state: DraftingState) -> DraftingState:
+    """
+    Reads: last_question_batch, latest_user_input
+    Writes: slots (merge), qa_history append, clarification_round += 1
+    """
+    batch = dict(state.get("last_question_batch") or {})
+    raw_answer = str(state.get("latest_user_input") or "")
+    questions = batch.get("questions", []) or []
+
+    slots = dict(state.get("slots") or {})
+    parsed = _parse_kv_lines(raw_answer)
+
+    expected_slot_keys: list[str] = []
+    for q in questions:
+        if isinstance(q, dict):
+            expected_slot_keys.append(str(q.get("slot_key") or ""))
+        elif isinstance(q, QuestionGenQuestion):
+            expected_slot_keys.append(q.slot_key)
+
+    # If user didn't use key:value lines and only one question, take whole answer.
+    if not parsed and len(expected_slot_keys) == 1 and raw_answer.strip():
+        parsed[expected_slot_keys[0]] = raw_answer.strip()
+
+    updates: dict[str, str] = {}
+    unknown_keys: list[str] = []
+    for k in expected_slot_keys:
+        if not k:
+            continue
+        if k not in parsed:
+            continue
+        v = str(parsed.get(k) or "").strip()
+        if v.lower() in {"[unknown]", "unknown", "[blank]", "blank"}:
+            unknown_keys.append(k)
+            slots.pop(k, None)
+            continue
+        slots[k] = v
+        updates[k] = v
+
+    round_no = int(state.get("clarification_round") or 0) + 1
+    qa_entry = {
+        "batch_id": batch.get("batch_id"),
+        "batch_purpose": batch.get("batch_purpose"),
+        "questions": questions,
+        "answer": raw_answer,
+        "updates": updates,
+        "unknown_keys": unknown_keys,
+        "round": round_no,
+    }
+
+    return {
+        "slots": slots,
+        "qa_history": [qa_entry],
+        "clarification_round": round_no,
+        "debug_log": [f"ingest_user_input(updated={list(updates.keys())})"],
+    }
 
 
-def node_bump_revision(state: PlaintState) -> PlaintState:
-    decision = FinalReviewDecision.model_validate(state.get("final_review") or {})
-    revision_count = int(state.get("revision_count") or 0)
-    if not decision.approved and decision.revision_instructions.strip():
-        revision_count += 1
-    return {"revision_count": revision_count, "log": [f"revision_count={revision_count}"]}
+def node_planner(state: DraftingState) -> DraftingState:
+    """
+    🧠 Reads: user_query, draft_type, ris, slots, validation_report, preferences
+    🧠 Writes: draft_plan, research_tasks
+    """
+    if ENGINE is None:
+        raise RuntimeError("LLM engine not initialized.")
+    llm = ENGINE
+
+    user_query = str(state.get("user_query") or "")
+    draft_type = str(state.get("draft_type") or DEFAULT_DRAFT_TYPE)
+    ris = dict(state.get("ris") or {})
+    slots = dict(state.get("slots") or {})
+    validation_report = dict(state.get("validation_report") or {})
+    forum = state.get("forum")
+    jurisdiction = state.get("jurisdiction")
+
+    user_prompt = wrap(
+        f"""
+        user_query:
+        {user_query}
+
+        draft_type: {draft_type}
+        forum: {forum if forum else ""}
+        jurisdiction: {jurisdiction if jurisdiction else ""}
+
+        RIS (JSON):
+        {json.dumps(ris, indent=2)}
+
+        slots (JSON):
+        {json.dumps(slots, indent=2)}
+
+        validation_report (JSON):
+        {json.dumps(validation_report, indent=2)}
+        """
+    )
+    out = cast(PlannerOut, llm.call_structured(agent="planner", system=PLANNER_SYSTEM_PROMPT, user=user_prompt, schema=PlannerOut))
+
+    # Basic deterministic guardrails: ensure section ordering is stable and unique.
+    sections = sorted(out.draft_plan.sections, key=lambda s: (s.order, s.section_id))
+    out = out.model_copy(update={"draft_plan": out.draft_plan.model_copy(update={"sections": sections})})
+
+    return {
+        "draft_plan": out.draft_plan.model_dump(),
+        "research_tasks": [t.model_dump() for t in out.research_tasks],
+        "debug_log": [f"planner(tasks={len(out.research_tasks)})"],
+    }
 
 
-def node_deliver(state: PlaintState, runtime: Runtime[Ctx]) -> PlaintState:
-    case_id = runtime.context.case_id
+def node_research_dispatch(state: DraftingState) -> Command["researcher_worker"]:
+    """
+    🧩 Reads: research_tasks
+    🧩 Sends: N parallel `researcher_worker` tasks via Send
+    """
+    tasks = state.get("research_tasks") or []
+    draft_type = str(state.get("draft_type") or DEFAULT_DRAFT_TYPE)
+    forum = state.get("forum")
+    jurisdiction = state.get("jurisdiction")
+    slots = dict(state.get("slots") or {})
+
+    sends: list[Send] = []
+    for t in tasks:
+        sends.append(
+            Send(
+                "researcher_worker",
+                {
+                    "research_task": t,
+                    "draft_type": draft_type,
+                    "forum": forum,
+                    "jurisdiction": jurisdiction,
+                    "slots": slots,
+                },
+            )
+        )
+
+    if not sends:
+        # No research tasks: proceed directly to compiler.
+        return Command(goto="compiler", update={"debug_log": ["research_dispatch(n=0) -> compiler"]})
+
+    return Command(goto=sends, update={"debug_log": [f"research_dispatch(n={len(sends)})"]})
+
+
+def node_researcher_worker(state: dict[str, Any]) -> DraftingState:
+    """
+    🧠 Reads: one research_task + minimal context
+    🧠 Writes: research_results += [result]
+    """
+    if ENGINE is None:
+        raise RuntimeError("LLM engine not initialized.")
+    llm = ENGINE
+
+    task = state.get("research_task") or {}
+    draft_type = str(state.get("draft_type") or "")
+    forum = state.get("forum") or ""
+    jurisdiction = state.get("jurisdiction") or ""
+    slots = state.get("slots") or {}
+
+    user_prompt = wrap(
+        f"""
+        draft_type: {draft_type}
+        forum: {forum}
+        jurisdiction: {jurisdiction}
+
+        research_task (JSON):
+        {json.dumps(task, indent=2)}
+
+        relevant slots (JSON):
+        {json.dumps(slots, indent=2)}
+        """
+    )
+    out = cast(
+        ResearcherWorkerOut,
+        llm.call_structured(
+            agent="researcher_worker",
+            system=RESEARCHER_WORKER_SYSTEM_PROMPT,
+            user=user_prompt,
+            schema=ResearcherWorkerOut,
+        ),
+    )
+    result = out.research_results[0]
+
+    # Enforce task identity deterministically.
+    task_id = str(task.get("task_id") or result.task_id)
+    topic = str(task.get("topic") or result.topic)
+    fixed = result.model_copy(update={"task_id": task_id, "topic": topic})
+
+    return {"research_results": [fixed.model_dump()], "debug_log": [f"researcher_worker(done {task_id})"]}
+
+
+def node_research_join(state: DraftingState) -> DraftingState:
+    """
+    🧩 Fan-in reducer stage:
+    - Sort/dedup by task_id because parallel updates may be unordered.
+    - Uses reducer (merge_research_results) to reorder safely via tuple-upserts.
+    """
+    results = [dict(x) for x in (state.get("research_results") or [])]
+    tasks = [dict(x) for x in (state.get("research_tasks") or [])]
+
+    # Desired order: research_tasks order (fallback: task_id).
+    order_index: dict[str, int] = {}
+    for idx, t in enumerate(tasks):
+        tid = str(t.get("task_id") or "")
+        if tid:
+            order_index[tid] = idx
+
+    def sort_key(r: dict[str, Any]) -> tuple[int, str]:
+        tid = str(r.get("task_id") or "")
+        return (order_index.get(tid, 10**9), tid)
+
+    # Dedup: keep highest confidence if duplicates exist.
+    best: dict[str, dict[str, Any]] = {}
+    for r in results:
+        tid = str(r.get("task_id") or "")
+        if not tid:
+            continue
+        conf = float(r.get("confidence") or 0.0)
+        prev = best.get(tid)
+        if prev is None:
+            best[tid] = r
+        else:
+            prev_conf = float(prev.get("confidence") or 0.0)
+            if conf >= prev_conf:
+                best[tid] = r
+
+    ordered = sorted(best.values(), key=sort_key)
+    upserts: list[tuple[str, dict[str, Any]]] = [(str(r.get("task_id") or ""), r) for r in ordered]
+
+    return {"research_results": upserts, "debug_log": [f"research_join(n={len(ordered)})"]}
+
+
+def node_compiler(state: DraftingState) -> DraftingState:
+    """
+    🧠 Reads: draft_plan, research_results, slots, validation_report
+    🧠 Writes: compiled_bundle
+    """
+    if ENGINE is None:
+        raise RuntimeError("LLM engine not initialized.")
+    llm = ENGINE
+
+    draft_plan = dict(state.get("draft_plan") or {})
+    research_results = list(state.get("research_results") or [])
+    slots = dict(state.get("slots") or {})
+    validation_report = dict(state.get("validation_report") or {})
+
+    user_prompt = wrap(
+        f"""
+        draft_plan (JSON):
+        {json.dumps(draft_plan, indent=2)}
+
+        research_results (JSON):
+        {json.dumps(research_results, indent=2)}
+
+        slots (JSON):
+        {json.dumps(slots, indent=2)}
+
+        validation_report (JSON):
+        {json.dumps(validation_report, indent=2)}
+        """
+    )
+    out = cast(CompilerOut, llm.call_structured(agent="compiler", system=COMPILER_SYSTEM_PROMPT, user=user_prompt, schema=CompilerOut))
+    return {"compiled_bundle": out.compiled_bundle.model_dump(), "debug_log": ["compiler(done)"]}
+
+
+def node_formatter(state: DraftingState) -> DraftingState:
+    """
+    🧠 Reads: draft_plan, compiled_bundle, slots, validation_report
+    🧠 Writes: final_output
+    """
+    if ENGINE is None:
+        raise RuntimeError("LLM engine not initialized.")
+    llm = ENGINE
+
+    draft_plan = dict(state.get("draft_plan") or {})
+    compiled_bundle = dict(state.get("compiled_bundle") or {})
+    slots = dict(state.get("slots") or {})
+    validation_report = dict(state.get("validation_report") or {})
+
+    user_prompt = wrap(
+        f"""
+        draft_plan (JSON):
+        {json.dumps(draft_plan, indent=2)}
+
+        compiled_bundle (JSON):
+        {json.dumps(compiled_bundle, indent=2)}
+
+        slots (JSON):
+        {json.dumps(slots, indent=2)}
+
+        validation_report (JSON):
+        {json.dumps(validation_report, indent=2)}
+        """
+    )
+    out = cast(FormatterOut, llm.call_structured(agent="formatter", system=FORMATTER_SYSTEM_PROMPT, user=user_prompt, schema=FormatterOut))
+    return {"final_output": out.final_output.model_dump(), "debug_log": ["formatter(done)"]}
+
+
+# -----------------------------
+# 12) Graph build (matches node map)
+# -----------------------------
+
+
+builder = StateGraph(DraftingState, context_schema=Ctx)
+
+builder.add_node("intake_router", node_intake_router)
+builder.add_node("ris_builder", node_ris_builder)
+builder.add_node("validator", node_validator)
+builder.add_node("question_gen", node_question_gen)
+builder.add_node("hitl_interrupt", node_hitl_interrupt)
+builder.add_node("ingest_user_input", node_ingest_user_input)
+builder.add_node("planner", node_planner)
+builder.add_node("research_dispatch", node_research_dispatch)
+builder.add_node("researcher_worker", node_researcher_worker)
+builder.add_node("research_join", node_research_join, defer=True)
+builder.add_node("compiler", node_compiler)
+builder.add_node("formatter", node_formatter)
+
+builder.add_edge(START, "intake_router")
+builder.add_edge("intake_router", "ris_builder")
+builder.add_edge("ris_builder", "validator")
+builder.add_conditional_edges(
+    "validator",
+    route_after_validator,
+    {"question_gen": "question_gen", "planner": "planner"},
+)
+
+builder.add_edge("question_gen", "hitl_interrupt")
+builder.add_edge("hitl_interrupt", "ingest_user_input")
+builder.add_edge("ingest_user_input", "validator")
+
+builder.add_edge("planner", "research_dispatch")
+builder.add_edge("researcher_worker", "research_join")
+builder.add_edge("research_join", "compiler")
+builder.add_edge("compiler", "formatter")
+builder.add_edge("formatter", END)
+
+# NOTE:
+# The `research_dispatch` node returns a `Command(goto=[Send(...)...])` which triggers N parallel `researcher_worker` runs.
+# Each worker appends to `research_results` (reducer-backed). `research_join` is deferred so it triggers after fan-out finishes.
+
+
+# -----------------------------
+# 13) Runner (handles interrupts + persistence)
+# -----------------------------
+
+
+def print_interrupt_prompt(prompt: dict[str, Any]) -> None:
+    title(str(prompt.get("title", "INTERRUPT")))
+    if prompt.get("user_message"):
+        print("\n" + str(prompt["user_message"]))
+    if prompt.get("questions"):
+        print("\nQuestions:")
+        for q in prompt["questions"]:
+            if isinstance(q, dict):
+                print(f"- {q.get('slot_key')}: {q.get('question')}")
+    if prompt.get("answer_format"):
+        print("\nAnswer format:")
+        print(str(prompt["answer_format"]))
+    if prompt.get("note"):
+        print("\nNote:")
+        print(str(prompt["note"]))
+
+
+def write_case_artifacts(*, case_id: str, state: dict[str, Any]) -> str:
     case_dir = ARTIFACTS_DIR / f"case_{case_id}"
     case_dir.mkdir(exist_ok=True)
 
     def write_json(name: str, obj: object) -> None:
         (case_dir / name).write_text(json.dumps(obj, indent=2), encoding="utf-8")
 
-    write_json("00_route.json", state.get("route", {}))
-    write_json("01_required_information_schema.json", state.get("ris", {}))
-    write_json("02_case_file.json", state.get("case_file", {}))
-    write_json("03_validation_report.json", state.get("validation", {}))
-    write_json("04_draft_plan.json", state.get("draft_plan", {}))
-    write_json("05_research_plan.json", state.get("research_plan", {}))
-    write_json("06_research_results.json", state.get("research_results", []))
-    write_json("07_research_pack.json", state.get("research_pack", {}))
-    write_json("08_compiled.json", state.get("compiled", {}))
-    write_json("09_audit_pack.json", state.get("audit_pack", {}))
+    (case_dir / "00_user_query.txt").write_text(str(state.get("user_query", "") or ""), encoding="utf-8")
+    write_json("01_ris.json", state.get("ris", {}))
+    write_json("02_slots.json", state.get("slots", {}))
+    write_json("03_validation_report.json", state.get("validation_report", {}))
+    write_json("04_last_question_batch.json", state.get("last_question_batch", {}))
+    write_json("05_qa_history.json", state.get("qa_history", []))
+    write_json("06_draft_plan.json", state.get("draft_plan", {}))
+    write_json("07_research_tasks.json", state.get("research_tasks", []))
+    write_json("08_research_results.json", state.get("research_results", []))
+    write_json("09_compiled_bundle.json", state.get("compiled_bundle", {}))
+    write_json("10_final_output.json", state.get("final_output", {}))
+    write_json("11_debug_log.json", state.get("debug_log", []))
 
-    final_pack = dict(state.get("final_draft", {}))
-    (case_dir / "10_draft.txt").write_text(str(final_pack.get("draft_text", "")), encoding="utf-8")
-    (case_dir / "11_one_page_brief.txt").write_text(str(final_pack.get("one_page_brief", "")), encoding="utf-8")
-    (case_dir / "12_annexures.txt").write_text(_render_bullets(final_pack.get("annexures", []) or []) + "\n", encoding="utf-8")
-    (case_dir / "13_compliance_checklist.txt").write_text(
-        _render_bullets(final_pack.get("compliance_checklist", []) or []) + "\n", encoding="utf-8"
-    )
-    (case_dir / "14_next_steps.txt").write_text(_render_bullets(final_pack.get("next_steps", []) or []) + "\n", encoding="utf-8")
+    final_output = dict(state.get("final_output") or {})
+    (case_dir / "12_final_draft.txt").write_text(str(final_output.get("final_draft", "") or ""), encoding="utf-8")
+    audit_pack = final_output.get("audit_pack", {}) or {}
+    write_json("13_audit_pack.json", audit_pack)
+    annex = final_output.get("annexure_list", []) or []
+    (case_dir / "14_annexure_list.txt").write_text("\n".join([f"- {x}" for x in annex]) + "\n", encoding="utf-8")
 
-    store_put(runtime, ("cases", case_id), "delivery", {"case_dir": str(case_dir)})
-    return {"output_dir": str(case_dir), "log": [f"delivered to {case_dir}"]}
-
-
-# -----------------------------
-# 12) Build LangGraph workflow
-# -----------------------------
-
-builder = StateGraph(PlaintState, context_schema=Ctx)
-
-builder.add_node("init", node_init)
-builder.add_node("router", node_intake_router)
-builder.add_node("ris_builder", node_ris_builder)
-builder.add_node("validator", node_validator)
-builder.add_node("question_generator", node_question_generator)
-builder.add_node("wait_for_user", node_wait_for_user)
-builder.add_node("answer_extractor", node_answer_extractor)
-builder.add_node("draft_plan", node_draft_plan)
-builder.add_node("research_plan", node_research_plan)
-builder.add_node("research_worker", node_research_worker)
-builder.add_node("research_reduce", node_research_reduce, defer=True)
-builder.add_node("compiler", node_compiler)
-builder.add_node("assembler", node_assembler)
-builder.add_node("formatter", node_formatter)
-builder.add_node("final_review", node_final_review)
-builder.add_node("bump_revision", node_bump_revision)
-builder.add_node("deliver", node_deliver)
-
-builder.add_edge(START, "init")
-builder.add_edge("init", "router")
-builder.add_edge("router", "ris_builder")
-builder.add_edge("ris_builder", "validator")
-builder.add_conditional_edges(
-    "validator",
-    route_after_validator,
-    {"question_generator": "question_generator", "draft_plan": "draft_plan"},
-)
-builder.add_edge("question_generator", "wait_for_user")
-builder.add_edge("wait_for_user", "answer_extractor")
-builder.add_edge("answer_extractor", "validator")
-builder.add_edge("draft_plan", "research_plan")
-
-builder.add_conditional_edges("research_plan", route_to_research_workers)
-builder.add_edge("research_worker", "research_reduce")
-builder.add_edge("research_reduce", "compiler")
-builder.add_edge("compiler", "assembler")
-builder.add_edge("assembler", "formatter")
-builder.add_edge("formatter", "final_review")
-builder.add_conditional_edges("final_review", route_after_final_review, {"deliver": "deliver", "compiler": "bump_revision", "final_review": "final_review"})
-builder.add_edge("bump_revision", "compiler")
-builder.add_edge("deliver", END)
+    return str(case_dir)
 
 
-# -----------------------------
-# 13) Runner (handles interrupts)
-# -----------------------------
-
-
-DEMO_ANSWERS: list[str] = [
-    # Batch 1: first 6 mandatory keys (+ proceed_with_blanks asked by the system)
-    "\n".join(
-        [
-            "court_name: City Civil Court at Bengaluru",
-            "plaintiff: Mr. A, adult Indian citizen",
-            "defendant: M/s B Pvt Ltd, company incorporated under Companies Act",
-            "plaintiff_address: Bengaluru, Karnataka (service address)",
-            "defendant_address: Bengaluru, Karnataka (registered office/service)",
-            "facts_timeline: 2024-01-10 contract executed at Bengaluru; 2024-02-05 invoice for INR 5,00,000; 2024-03-01 reminder; non-payment continues.",
-            "proceed_with_blanks: no",
-        ]
-    ),
-    # Batch 2: next mandatory keys
-    "\n".join(
-        [
-            "cause_of_action: Defendant failed to pay the invoice amount despite contractual obligation and repeated demands.",
-            "jurisdiction_facts: Cause of action arose in Bengaluru; contract executed/performed in Bengaluru; defendant carries on business in Bengaluru.",
-            "reliefs: Decree for INR 5,00,000 with interest; costs; any other relief deemed fit.",
-            "interim_relief_needed: no",
-            "valuation: INR 5,00,000",
-            "court_fee: TO BE COMPUTED AS PER APPLICABLE COURT FEE ACT (TO VERIFY)",
-            "proceed_with_blanks: no",
-        ]
-    ),
-    # Batch 3: remaining mandatory keys
-    "\n".join(
-        [
-            "limitation: Within limitation based on 2024 cause of action (TO VERIFY).",
-            "documents: Service contract dated 2024-01-10; Invoice dated 2024-02-05; Reminder email dated 2024-03-01.",
-            "is_commercial_dispute: no",
-            "proceed_with_blanks: no",
-        ]
-    ),
-    # Final review
-    "approved: yes",
-]
-
-
-def print_interrupt_prompt(prompt: dict) -> None:
-    title(str(prompt.get("title", "INTERRUPT")))
-    if prompt.get("questions"):
-        print("\nAnswer these:")
-        for q in prompt["questions"]:
-            key = q.get("key")
-            question = q.get("question")
-            example = q.get("example")
-            required = q.get("required", True)
-            suffix = " (required)" if required else " (optional)"
-            print(f"- {key}{suffix}: {question}")
-            if example:
-                print(f"  example: {example}")
-    if prompt.get("missing_required_fields"):
-        print("\nMissing required fields (blockers):")
-        for m in prompt["missing_required_fields"]:
-            print("- " + str(m))
-    if prompt.get("risk_flags"):
-        print("\nRisk flags:")
-        for r in prompt["risk_flags"]:
-            print("- " + str(r))
-    if prompt.get("answer_format"):
-        print("\nAnswer format:")
-        print(str(prompt["answer_format"]))
-    if prompt.get("one_page_brief"):
-        print("\nOne-page brief:")
-        print(str(prompt["one_page_brief"]))
-    if prompt.get("missing_inputs"):
-        print("\nMissing inputs (placeholders):")
-        for m in prompt["missing_inputs"]:
-            print("- " + str(m))
-    if prompt.get("draft_preview"):
-        print("\nDraft preview:")
-        print(str(prompt["draft_preview"]))
-    if prompt.get("instructions"):
-        print("\nInstructions:")
-        print(str(prompt["instructions"]))
-    if prompt.get("note"):
-        print("\nNote:")
-        print(str(prompt["note"]))
-
-
-def run(*, demo: bool, mock: bool, thread_id: str | None, case_id: str | None, resume_answer: str | None) -> None:
+def run(*, thread_id: str | None, case_id: str | None, resume_answer: str | None) -> None:
     global ENGINE
 
     if case_id is None:
         case_id = str(uuid.uuid4())[:8]
     if thread_id is None:
-        thread_id = f"plaint-{case_id}"
+        thread_id = f"draft-{case_id}"
 
     config = {"configurable": {"thread_id": thread_id}}
     context = Ctx(case_id=case_id, user_id="u1")
 
-    title("Deep Research: Litigation Drafting → Civil Pleadings → PLAINT")
+    title("Deep Research Drafting (Contract-Driven) — India")
     show("case_id", case_id)
     show("thread_id", thread_id)
     show("artifacts_dir", str(ARTIFACTS_DIR))
 
+    # Import optional persistence deps at runtime (keeps import errors readable).
     try:
         from langgraph.cache.sqlite import SqliteCache  # type: ignore
         from langgraph.checkpoint.sqlite import SqliteSaver  # type: ignore
@@ -2107,25 +1489,20 @@ def run(*, demo: bool, mock: bool, thread_id: str | None, case_id: str | None, r
         print(
             wrap(
                 """
-                This script uses SQLite-backed persistence (checkpointer/store/cache) so it can pause for HITL interrupts
-                and resume later. Those SQLite components require optional dependencies that are usually installed via `uv`.
-
-                Fix:
-                - Run via `uv run library_mastery/deep_research/drafting_deepresearch2.py ...`, or
-                - Install the repo's locked dependencies in an environment where `langgraph` deps are available.
+                This script uses SQLite-backed persistence so it can pause for HITL interrupts and resume later.
+                Run via `uv run ...` to install optional dependencies.
                 """
             )
         )
         raise SystemExit(1) from e
 
+    cache = SqliteCache(path=str(CACHE_DB))
+    ENGINE = LLMEngine(model=ANSWER_MODEL, cache=cache)
+
     with SqliteSaver.from_conn_string(str(CHECKPOINT_DB)) as checkpointer:
         with SqliteStore.from_conn_string(str(STORE_DB)) as store:
-            cache = SqliteCache(path=str(CACHE_DB)) if not mock else None
-            ENGINE = LLMEngine(model=ANSWER_MODEL, cache=cache, mock=mock)
-
             graph = builder.compile(checkpointer=checkpointer, store=store)
 
-            # If resuming, try to resume from an outstanding interrupt.
             if resume_answer is not None:
                 state_in: object = Command(resume=resume_answer)
             else:
@@ -2133,19 +1510,27 @@ def run(*, demo: bool, mock: bool, thread_id: str | None, case_id: str | None, r
                     snap = graph.get_state(config)
                 except Exception:
                     snap = None
+
                 if snap is not None and getattr(snap, "interrupts", None):
-                    # Interactive resume: show pending interrupt prompt
                     intr = snap.interrupts[0]
                     prompt = intr.value
                     if not isinstance(prompt, dict):
-                        prompt = {"title": "INTERRUPT", "note": str(prompt)}
-                    step("Found a pending interrupt for this thread_id. Answer to resume.")
+                        prompt = {"title": "INTERRUPT", "user_message": str(prompt)}
+                    step("Found a pending interrupt. Answer to resume.")
                     print_interrupt_prompt(prompt)
                     ans = read_multiline()
                     state_in = Command(resume=ans)
                 else:
-                    state_in = {}
-            demo_answers = list(DEMO_ANSWERS)
+                    # New run: ask for initial user_query interactively.
+                    intro = wrap(
+                        """
+                        Provide the initial drafting instruction for your client matter.
+                        Include (if available): court/forum, parties, dates, material facts timeline, reliefs, jurisdiction facts,
+                        valuation/court-fee position, limitation position, and documents list.
+                        """
+                    )
+                    user_query = read_multiline(prompt=intro)
+                    state_in = {"user_query": user_query}
 
             while True:
                 interrupted = False
@@ -2155,38 +1540,20 @@ def run(*, demo: bool, mock: bool, thread_id: str | None, case_id: str | None, r
                         intr = chunk["__interrupt__"][0]
                         prompt = intr.value
                         if not isinstance(prompt, dict):
-                            prompt = {"title": "INTERRUPT", "note": str(prompt)}
-
+                            prompt = {"title": "INTERRUPT", "user_message": str(prompt)}
                         print_interrupt_prompt(prompt)
-
-                        if demo:
-                            if demo_answers:
-                                answer = demo_answers.pop(0)
-                            else:
-                                title_text = str(prompt.get("title", "")).lower()
-                                if "final review" in title_text:
-                                    answer = "approved: yes"
-                                else:
-                                    answer = "proceed_with_blanks: yes"
-                            step("Demo answer used")
-                            print(answer)
-                        else:
-                            answer = read_multiline()
-
-                        state_in = Command(resume=answer)
+                        ans = read_multiline()
+                        state_in = Command(resume=ans)
                         break
 
-                    # Show node updates (compact)
                     if isinstance(chunk, dict) and len(chunk) == 1:
                         node_name = next(iter(chunk.keys()))
                         payload = chunk[node_name]
                         step(f"node: {node_name}")
-                        if node_name in {"init"}:
-                            show("meta", payload)
-                        elif node_name in {"answer_extractor"} and isinstance(payload, dict):
-                            show("case_file_keys", sorted(list((payload.get("case_file") or {}).keys())))
-                        elif node_name in {"deliver"} and isinstance(payload, dict):
-                            show("output_dir", payload.get("output_dir"))
+                        if node_name in {"validator"} and isinstance(payload, dict):
+                            show("ready_for_planning", payload.get("validation_report", {}).get("ready_for_planning"))
+                        elif node_name in {"formatter"} and isinstance(payload, dict):
+                            show("final_output_keys", sorted(list((payload.get("final_output") or {}).keys())))
                         else:
                             show("update", payload)
                     else:
@@ -2197,17 +1564,23 @@ def run(*, demo: bool, mock: bool, thread_id: str | None, case_id: str | None, r
 
             snap = graph.get_state(config)
             step("DONE")
-            show("output_dir", snap.values.get("output_dir"))
-            print("\nOpen the folder above to see the full delivery pack.")
+            values = cast(dict[str, Any], snap.values if isinstance(snap.values, dict) else {})
+            case_dir = write_case_artifacts(case_id=case_id, state=values)
+            show("case_dir", case_dir)
+            final_output = dict(values.get("final_output") or {})
+            final_draft = str(final_output.get("final_draft", "") or "")
+            if final_draft.strip():
+                print("\nFINAL DRAFT:\n")
+                print(final_draft)
 
 
 # -----------------------------
 # 14) CLI
 # -----------------------------
 
+
 if __name__ == "__main__":
-    demo = "--demo" in sys.argv
-    mock = "--mock" in sys.argv
+    require_env("OPENAI_API_KEY")
 
     thread_id: str | None = None
     case_id: str | None = None
@@ -2230,8 +1603,4 @@ if __name__ == "__main__":
             continue
         i += 1
 
-    if not mock:
-        # Real LLM mode requires API key.
-        require_env("OPENAI_API_KEY")
-
-    run(demo=demo, mock=mock, thread_id=thread_id, case_id=case_id, resume_answer=resume_answer)
+    run(thread_id=thread_id, case_id=case_id, resume_answer=resume_answer)
