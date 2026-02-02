@@ -49,9 +49,6 @@ from pathlib import Path
 from pprint import pformat
 from typing import Any, Annotated, Literal, Optional, TypedDict
 
-from dotenv import load_dotenv
-
-load_dotenv()
 # -----------------------------
 # 0) Bootstrapping for monorepo
 # -----------------------------
@@ -97,13 +94,9 @@ except Exception:  # pragma: no cover
         return
 
 
-from langchain_core.messages import HumanMessage, SystemMessage
-from langgraph.cache.sqlite import SqliteCache
-from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.constants import END, START
 from langgraph.graph import StateGraph
 from langgraph.runtime import Runtime
-from langgraph.store.sqlite import SqliteStore
 from langgraph.types import Command, Send, interrupt
 from pydantic import BaseModel, Field
 
@@ -808,10 +801,12 @@ def select_next_question_keys(*, report: ValidationReportOut) -> list[str]:
 
 
 class LLMEngine:
-    def __init__(self, *, model: str, cache: Optional[SqliteCache], mock: bool) -> None:
+    def __init__(self, *, model: str, cache: Optional[object], mock: bool) -> None:
         self._model = model
         self._cache = cache
         self._mock = mock
+        self._SystemMessage: type | None = None
+        self._HumanMessage: type | None = None
 
         if not mock:
             require_env("OPENAI_API_KEY")
@@ -820,13 +815,16 @@ class LLMEngine:
         if not mock:
             try:
                 from langchain_openai import ChatOpenAI  # type: ignore
+                from langchain_core.messages import HumanMessage, SystemMessage  # type: ignore
             except Exception as e:  # pragma: no cover
                 raise RuntimeError(
-                    "Missing dependency: langchain-openai. Install it to use real LLM mode, "
+                    "Missing dependency: langchain-openai / langchain-core. Install them to use real LLM mode, "
                     "or run with --mock for offline mode."
                 ) from e
 
             self._llm = ChatOpenAI(model=model, temperature=0)
+            self._SystemMessage = SystemMessage
+            self._HumanMessage = HumanMessage
 
     def _cache_key(self, agent: str, system: str, user: str, schema_name: str) -> str:
         h = hashlib.sha256()
@@ -858,9 +856,11 @@ class LLMEngine:
 
         if self._llm is None:
             raise RuntimeError("LLM is not initialized (mock mode should have returned earlier).")
+        if self._SystemMessage is None or self._HumanMessage is None:
+            raise RuntimeError("Message classes are not initialized (missing langchain-core).")
 
         structured = self._llm.with_structured_output(schema)  # type: ignore[attr-defined]
-        out = structured.invoke([SystemMessage(content=system), HumanMessage(content=user)])
+        out = structured.invoke([self._SystemMessage(content=system), self._HumanMessage(content=user)])
 
         if self._cache is not None:
             self._cache.set({(ns, cache_key): (out.model_dump(), 24 * 3600)})
@@ -1100,13 +1100,21 @@ ENGINE: LLMEngine | None = None
 # -----------------------------
 
 
+def store_put(runtime: Runtime[Ctx], namespace: tuple[str, str], key: str, value: object) -> None:
+    store = getattr(runtime, "store", None)
+    if store is None:
+        return
+    store.put(namespace, key, value)  # type: ignore[union-attr]
+
+
 def node_init(_: PlaintState, runtime: Runtime[Ctx]) -> PlaintState:
     # Create a persistent namespace for this case in the SQLite store.
-    runtime.store.put(
+    store_put(
+        runtime,
         ("cases", runtime.context.case_id),
         "meta",
         {"category": CATEGORY, "subcategory": SUBCATEGORY, "doc_type": DOC_TYPE, "forum": FORUM},
-    )  # type: ignore[union-attr]
+    )
     return {
         "category": CATEGORY,
         "subcategory": SUBCATEGORY,
@@ -1148,13 +1156,13 @@ def node_intake_router(_: PlaintState, runtime: Runtime[Ctx]) -> PlaintState:
         jurisdiction_scope="India (civil courts) — forum depends on territorial/pecuniary facts (TO VERIFY).",
         notes="Plaint-only demo router.",
     )
-    runtime.store.put(("cases", runtime.context.case_id), "route", route.model_dump())  # type: ignore[union-attr]
+    store_put(runtime, ("cases", runtime.context.case_id), "route", route.model_dump())
     return {"route": route.model_dump(), "forum": route.forum, "log": ["router: classified plaint workflow"]}
 
 
 def node_ris_builder(_: PlaintState, runtime: Runtime[Ctx]) -> PlaintState:
     ris = build_plaint_ris()
-    runtime.store.put(("cases", runtime.context.case_id), "ris", ris.model_dump())  # type: ignore[union-attr]
+    store_put(runtime, ("cases", runtime.context.case_id), "ris", ris.model_dump())
     return {"ris": ris.model_dump(), "log": ["ris built"]}
 
 
@@ -1163,7 +1171,7 @@ def node_validator(state: PlaintState, runtime: Runtime[Ctx]) -> PlaintState:
     case_file = dict(state.get("case_file", {}))
     blanks_accepted = list(state.get("blanks_accepted", []))
     report = validate_case_file(ris=ris, case_file=case_file, blanks_accepted=blanks_accepted)
-    runtime.store.put(("cases", runtime.context.case_id), "validation", report.model_dump())  # type: ignore[union-attr]
+    store_put(runtime, ("cases", runtime.context.case_id), "validation", report.model_dump())
     return {"validation": report.model_dump(), "log": [f"validated ready={report.ready_for_planning}"]}
 
 
@@ -1183,8 +1191,24 @@ def node_question_generator(state: PlaintState) -> PlaintState:
     case_file = dict(state.get("case_file", {}))
 
     expected_keys = select_next_question_keys(report=report)
-    if report.missing_required_fields:
+
+    # Add risk-reducer (optional) keys if there's room.
+    for candidate in ("cause_of_action_date", "proposed_filing_date"):
+        if len(expected_keys) >= MAX_QUESTIONS_PER_BATCH:
+            break
+        if candidate in expected_keys:
+            continue
+        if is_missing_value(case_file.get(candidate)):
+            expected_keys.append(candidate)
+
+    if report.missing_required_fields and "proceed_with_blanks" not in expected_keys:
         expected_keys = expected_keys + ["proceed_with_blanks"]
+
+    blocker_keys: set[str] = set()
+    for entry in report.missing_required_fields:
+        k = entry.split(" — ", 1)[0].strip()
+        if k:
+            blocker_keys.add(k)
 
     expected_desc: list[str] = []
     for k in expected_keys:
@@ -1222,7 +1246,55 @@ def node_question_generator(state: PlaintState) -> PlaintState:
         schema=QuestionBatchOut,
     )
 
-    return {"intake_batch": batch.model_dump(), "log": [f"questions generated ({len(batch.questions)})"]}
+    # Enforce deterministic expected_keys and prevent drift: we sanitize LLM output.
+    questions_by_key = {q.key: q for q in batch.questions}
+    sanitized_questions: list[Question] = []
+    for k in expected_keys:
+        q = questions_by_key.get(k)
+        if q is None:
+            q = Question(key=k, question=f"Provide {k}.", required=True)
+        if k == "proceed_with_blanks":
+            sanitized_questions.append(
+                Question(
+                    key=k,
+                    question=q.question or "Proceed with placeholders for missing required items? (yes/no)",
+                    required=False,
+                    category="assumption",
+                    priority=1,
+                    example="no",
+                )
+            )
+        elif k in blocker_keys:
+            sanitized_questions.append(
+                Question(
+                    key=k,
+                    question=q.question or f"Provide {k}.",
+                    required=True,
+                    category="blocker",
+                    priority=1,
+                    example=q.example,
+                )
+            )
+        else:
+            sanitized_questions.append(
+                Question(
+                    key=k,
+                    question=q.question or f"Provide {k}.",
+                    required=False,
+                    category="risk",
+                    priority=2,
+                    example=q.example,
+                )
+            )
+
+    sanitized_batch = QuestionBatchOut(
+        batch_name=batch.batch_name or "Intake questions",
+        questions=sanitized_questions,
+        expected_keys=expected_keys,
+        answer_format=batch.answer_format
+        or "Answer as key: value lines (end with blank line). If unknown, write [UNKNOWN].",
+    )
+    return {"intake_batch": sanitized_batch.model_dump(), "log": [f"questions generated ({len(sanitized_questions)})"]}
 
 
 def node_wait_for_user(state: PlaintState) -> PlaintState:
@@ -1307,10 +1379,12 @@ def node_answer_extractor(state: PlaintState, runtime: Runtime[Ctx]) -> PlaintSt
         schema=IntakeExtractOut,
     )
 
+    allowed_case_keys = set(expected_keys) - {"proceed_with_blanks"}
+    extracted_updates = {k: v for k, v in extracted.updates.items() if k in allowed_case_keys}
+    extracted_unknowns = [k for k in extracted.explicitly_unknown if k in allowed_case_keys]
+
     # Apply updates
-    for k, v in extracted.updates.items():
-        if k == "proceed_with_blanks":
-            continue
+    for k, v in extracted_updates.items():
         if isinstance(v, str) and v.strip():
             case_file[k] = v.strip()
             if k in blanks:
@@ -1318,7 +1392,7 @@ def node_answer_extractor(state: PlaintState, runtime: Runtime[Ctx]) -> PlaintSt
             if k in blanks_accepted:
                 blanks_accepted.remove(k)
 
-    for k in extracted.explicitly_unknown:
+    for k in extracted_unknowns:
         if k not in blanks:
             blanks.append(k)
 
@@ -1332,16 +1406,16 @@ def node_answer_extractor(state: PlaintState, runtime: Runtime[Ctx]) -> PlaintSt
             if k and k not in blanks_accepted:
                 blanks_accepted.append(k)
 
-    runtime.store.put(("cases", runtime.context.case_id), "case_file", case_file)  # type: ignore[union-attr]
-    runtime.store.put(("cases", runtime.context.case_id), "blanks", {"blanks": blanks, "blanks_accepted": blanks_accepted})  # type: ignore[union-attr]
+    store_put(runtime, ("cases", runtime.context.case_id), "case_file", case_file)
+    store_put(runtime, ("cases", runtime.context.case_id), "blanks", {"blanks": blanks, "blanks_accepted": blanks_accepted})
 
     qa_entry = {
         "batch": batch.get("batch_name", ""),
         "questions": batch.get("questions", []),
         "answer": answer_text,
         "expected_keys": expected_keys,
-        "updates": extracted.updates,
-        "explicitly_unknown": extracted.explicitly_unknown,
+        "updates": extracted_updates,
+        "explicitly_unknown": extracted_unknowns,
         "proceed_with_blanks": bool(proceed) if proceed is not None else None,
         "what_i_understood": extracted.what_i_understood,
         "still_missing": extracted.still_missing,
@@ -1352,7 +1426,7 @@ def node_answer_extractor(state: PlaintState, runtime: Runtime[Ctx]) -> PlaintSt
         "blanks": blanks,
         "blanks_accepted": blanks_accepted,
         "qa_log": [qa_entry],
-        "log": [f"intake applied updates={list(extracted.updates.keys())} proceed_with_blanks={proceed}"],
+        "log": [f"intake applied updates={list(extracted_updates.keys())} proceed_with_blanks={proceed}"],
     }
 
 
@@ -1381,7 +1455,7 @@ def node_draft_plan(state: PlaintState, runtime: Runtime[Ctx]) -> PlaintState:
         """
     )
     out = llm.call_structured(agent="draft_planner", system=DRAFT_PLANNER_SYSTEM, user=user_prompt, schema=DraftPlanOut)
-    runtime.store.put(("cases", runtime.context.case_id), "draft_plan", out.model_dump())  # type: ignore[union-attr]
+    store_put(runtime, ("cases", runtime.context.case_id), "draft_plan", out.model_dump())
     return {"draft_plan": out.model_dump(), "log": ["draft plan created"]}
 
 
@@ -1409,7 +1483,7 @@ def node_research_plan(state: PlaintState, runtime: Runtime[Ctx]) -> PlaintState
         user=user_prompt,
         schema=ResearchPlanOut,
     )
-    runtime.store.put(("cases", runtime.context.case_id), "research_plan", out.model_dump())  # type: ignore[union-attr]
+    store_put(runtime, ("cases", runtime.context.case_id), "research_plan", out.model_dump())
     # Reset map-reduce accumulators for this run segment.
     return {"research_plan": out.model_dump(), "research_results": [], "research_pack": {}, "log": ["research plan created"]}
 
@@ -1496,7 +1570,7 @@ def node_research_reduce(state: PlaintState, runtime: Runtime[Ctx]) -> PlaintSta
         unresolved_conflicts=conflicts,
         by_task=results,
     )
-    runtime.store.put(("cases", runtime.context.case_id), "research_pack", pack.model_dump())  # type: ignore[union-attr]
+    store_put(runtime, ("cases", runtime.context.case_id), "research_pack", pack.model_dump())
     return {"research_pack": pack.model_dump(), "log": [f"research reduced tasks={len(results)}"]}
 
 
@@ -1553,7 +1627,7 @@ def node_compiler(state: PlaintState, runtime: Runtime[Ctx]) -> PlaintState:
         user=user_prompt,
         schema=CompiledDraftOut,
     )
-    runtime.store.put(("cases", runtime.context.case_id), "compiled", out.model_dump())  # type: ignore[union-attr]
+    store_put(runtime, ("cases", runtime.context.case_id), "compiled", out.model_dump())
     return {"compiled": out.model_dump(), "log": ["compiled draft payload created"]}
 
 
@@ -1641,7 +1715,7 @@ def node_assembler(state: PlaintState, runtime: Runtime[Ctx]) -> PlaintState:
         risk_flags=list(compiled.risk_flags or []),
         conflict_resolutions=list(compiled.conflict_resolutions or []),
     )
-    runtime.store.put(("cases", runtime.context.case_id), "assembled", assembled.model_dump())  # type: ignore[union-attr]
+    store_put(runtime, ("cases", runtime.context.case_id), "assembled", assembled.model_dump())
     return {"assembled": assembled.model_dump(), "log": ["assembled template sections"]}
 
 
@@ -1712,8 +1786,8 @@ def node_formatter(state: PlaintState, runtime: Runtime[Ctx]) -> PlaintState:
         audit_pack=audit,
     )
 
-    runtime.store.put(("cases", runtime.context.case_id), "final_draft", final_pack.model_dump())  # type: ignore[union-attr]
-    runtime.store.put(("cases", runtime.context.case_id), "audit_pack", audit.model_dump())  # type: ignore[union-attr]
+    store_put(runtime, ("cases", runtime.context.case_id), "final_draft", final_pack.model_dump())
+    store_put(runtime, ("cases", runtime.context.case_id), "audit_pack", audit.model_dump())
     return {"final_draft": final_pack.model_dump(), "audit_pack": audit.model_dump(), "log": ["formatted final draft"]}
 
 
@@ -1811,7 +1885,7 @@ def node_deliver(state: PlaintState, runtime: Runtime[Ctx]) -> PlaintState:
     )
     (case_dir / "14_next_steps.txt").write_text(_render_bullets(final_pack.get("next_steps", []) or []) + "\n", encoding="utf-8")
 
-    runtime.store.put(("cases", case_id), "delivery", {"case_dir": str(case_dir)})  # type: ignore[union-attr]
+    store_put(runtime, ("cases", case_id), "delivery", {"case_dir": str(case_dir)})
     return {"output_dir": str(case_dir), "log": [f"delivered to {case_dir}"]}
 
 
@@ -1966,9 +2040,29 @@ def run(*, demo: bool, mock: bool, thread_id: str | None, case_id: str | None, r
     show("thread_id", thread_id)
     show("artifacts_dir", str(ARTIFACTS_DIR))
 
+    try:
+        from langgraph.cache.sqlite import SqliteCache  # type: ignore
+        from langgraph.checkpoint.sqlite import SqliteSaver  # type: ignore
+        from langgraph.store.sqlite import SqliteStore  # type: ignore
+    except Exception as e:  # pragma: no cover
+        title("Missing dependencies for SQLite persistence")
+        print(
+            wrap(
+                """
+                This script uses SQLite-backed persistence (checkpointer/store/cache) so it can pause for HITL interrupts
+                and resume later. Those SQLite components require optional dependencies that are usually installed via `uv`.
+
+                Fix:
+                - Run via `uv run library_mastery/deep_research/drafting_deepresearch2.py ...`, or
+                - Install the repo's locked dependencies in an environment where `langgraph` deps are available.
+                """
+            )
+        )
+        raise SystemExit(1) from e
+
     with SqliteSaver.from_conn_string(str(CHECKPOINT_DB)) as checkpointer:
         with SqliteStore.from_conn_string(str(STORE_DB)) as store:
-            cache = SqliteCache(path=str(CACHE_DB))
+            cache = SqliteCache(path=str(CACHE_DB)) if not mock else None
             ENGINE = LLMEngine(model=ANSWER_MODEL, cache=cache, mock=mock)
 
             graph = builder.compile(checkpointer=checkpointer, store=store)
