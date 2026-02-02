@@ -2,24 +2,26 @@ from __future__ import annotations
 
 from pathlib import Path
 import sys
+from typing import Annotated
 
 _API_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(_API_ROOT))
 
 from _bootstrap import bootstrap_langgraph_namespace
-from _utils import banner, show
+from _utils import banner, print_graph, show
+
+
+def append_path(left: list[str], right: list[str] | None) -> list[str]:
+    return left + (right or [])
 
 
 def main() -> None:
     bootstrap_langgraph_namespace()
 
-    from typing import Annotated, Literal, TypedDict
+    from typing import Literal, TypedDict
 
     from langgraph.graph import END, START, StateGraph
     from langgraph.types import Command
-
-    def append_path(left: list[str], right: list[str] | None) -> list[str]:
-        return left + (right or [])
 
     class State(TypedDict):
         x: int
@@ -47,7 +49,7 @@ def main() -> None:
     )
 
     banner("ASCII Graph (destinations affect rendering)")
-    print(graph.get_graph().draw_ascii())
+    print_graph(graph.get_graph())
 
     banner("x < 0 routes to 'neg'")
     show("output", graph.invoke({"x": -2, "path": []}))
@@ -58,4 +60,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

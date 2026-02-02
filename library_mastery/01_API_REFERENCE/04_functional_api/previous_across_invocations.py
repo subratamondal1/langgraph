@@ -18,7 +18,7 @@ def main() -> None:
     from langgraph.func import entrypoint
 
     @entrypoint(checkpointer=InMemorySaver())
-    def counter(_: None, *, previous: int | None = None) -> int:
+    def counter(_: int, *, previous: int | None = None) -> int:
         # `previous` is the last return value for this thread_id (if any).
         return (previous or 0) + 1
 
@@ -26,12 +26,11 @@ def main() -> None:
     config = {"configurable": {"thread_id": thread_id}}
 
     banner("First invocation (no previous yet)")
-    show("result", counter.invoke(None, config))
+    show("result", counter.invoke(0, config))
 
     banner("Second invocation (previous injected from checkpoint)")
-    show("result", counter.invoke(None, config))
+    show("result", counter.invoke(0, config))
 
 
 if __name__ == "__main__":
     main()
-

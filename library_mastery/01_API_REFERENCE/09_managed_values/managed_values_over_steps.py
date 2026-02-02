@@ -44,7 +44,11 @@ def main() -> None:
     banner("Streaming values until recursion limit is hit (watch managed values change)")
     try:
         for chunk in graph.stream({"log": []}, {"recursion_limit": 4}, stream_mode="values"):
-            print(chunk["log"][-1])
+            if chunk.get("log"):
+                print(chunk["log"][-1])
+            else:
+                # First emitted value can be the initial state snapshot.
+                print({"log": chunk.get("log")})
     except GraphRecursionError as e:
         print("Caught:", type(e).__name__)
         print(str(e).splitlines()[0])
@@ -52,4 +56,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

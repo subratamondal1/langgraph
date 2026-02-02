@@ -2,12 +2,17 @@ from __future__ import annotations
 
 from pathlib import Path
 import sys
+from typing import Annotated
 
 _API_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(_API_ROOT))
 
 from _bootstrap import bootstrap_langgraph_namespace
 from _utils import banner, show
+
+
+def append(left: list[str], right: list[str] | None) -> list[str]:
+    return left + (right or [])
 
 
 def demo_error_two_writers() -> None:
@@ -45,12 +50,9 @@ def demo_error_two_writers() -> None:
 
 
 def demo_fix_with_reducer() -> None:
-    from typing import Annotated, TypedDict
+    from typing import TypedDict
 
     from langgraph.graph import END, START, StateGraph
-
-    def append(left: list[str], right: list[str] | None) -> list[str]:
-        return left + (right or [])
 
     class State(TypedDict):
         events: Annotated[list[str], append]
@@ -89,4 +91,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

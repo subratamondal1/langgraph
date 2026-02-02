@@ -7,7 +7,7 @@ _API_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(_API_ROOT))
 
 from _bootstrap import bootstrap_langgraph_namespace
-from _utils import banner, show
+from _utils import banner, print_graph, show
 
 
 def main() -> None:
@@ -41,7 +41,7 @@ def main() -> None:
     )
 
     banner("ASCII Graph")
-    print(app.get_graph().draw_ascii())
+    print_graph(app.get_graph())
 
     banner("invoke() output")
     out = app.invoke("foo")

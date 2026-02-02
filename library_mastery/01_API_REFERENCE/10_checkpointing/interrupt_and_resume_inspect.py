@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 import uuid
 import sys
+from typing import Optional
 
 _API_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(_API_ROOT))
@@ -14,7 +15,7 @@ from _utils import banner, show
 def main() -> None:
     bootstrap_langgraph_namespace()
 
-    from typing import Optional, TypedDict
+    from typing import TypedDict
 
     from langgraph.checkpoint.memory import InMemorySaver
     from langgraph.constants import START
@@ -57,4 +58,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

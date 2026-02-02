@@ -21,6 +21,17 @@ def main() -> None:
     from langgraph.store.base import BaseStore
     from langgraph.store.memory import InMemoryStore
 
+    # Tool conversion uses `get_type_hints(..., include_extras=True)` on the tool function.
+    # With `from __future__ import annotations`, annotations are stored as strings and
+    # must be resolvable from module globals.
+    globals().update(
+        {
+            "InjectedState": InjectedState,
+            "InjectedStore": InjectedStore,
+            "BaseStore": BaseStore,
+        }
+    )
+
     store = InMemoryStore()
 
     def memory_tool(
@@ -58,4 +69,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

@@ -10,6 +10,10 @@ from _bootstrap import bootstrap_langgraph_namespace
 from _utils import banner, show
 
 
+class TransientError(Exception):
+    """A toy exception that is considered retryable by LangGraph's default retry predicate."""
+
+
 def main() -> None:
     bootstrap_langgraph_namespace()
 
@@ -25,7 +29,9 @@ def main() -> None:
     def flaky(x: int) -> int:
         attempts[x] = attempts.get(x, 0) + 1
         if attempts[x] == 1:
-            raise ValueError(f"boom (first attempt for {x})")
+            # `ValueError` is *not* retried by default (treated as a programmer error).
+            # Use a custom exception to demonstrate retry behavior.
+            raise TransientError(f"boom (first attempt for {x})")
         return x + 10
 
     # Cache: deterministic "expensive" computation.
@@ -56,4 +62,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
