@@ -103,7 +103,7 @@ from langgraph.graph import StateGraph
 from langgraph.runtime import Runtime
 from langgraph.store.sqlite import SqliteStore
 from langgraph.types import Command, interrupt
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 # -----------------------------
 # 2) Tiny print helpers (simple)
@@ -205,27 +205,12 @@ INTAKE_QUESTIONER_SYSTEM = wrap(
     {BASE_SYSTEM_PROMPT}
 
     ROLE: Senior chamber lawyer taking instructions for drafting a civil PLAINT.
-    TASK: Generate the NEXT SMALL BATCH of intake questions (ordered, not random).
+    TASK: Generate the NEXT SINGLE intake question (one at a time).
 
     IMPORTANT:
-    - Ask only for missing information for this batch.
+    - Ask only for the requested key.
     - Keep questions short and practical.
-    - Provide a key for each question so the user can answer in key:value lines.
-    - After questions, include an "answer_format" instruction.
-    """
-)
-
-
-INTAKE_EXTRACTOR_SYSTEM = wrap(
-    f"""
-    {BASE_SYSTEM_PROMPT}
-
-    ROLE: Case file clerk.
-    TASK: Extract structured facts from the user's answer into the requested keys only.
-
-    IMPORTANT:
-    - Do not guess. If not present, omit the key.
-    - If user explicitly says unknown/blank, record it in `blanks`.
+    - Do not ask multiple questions at once.
     - Output must be VALID JSON matching the schema.
     """
 )
@@ -292,41 +277,33 @@ COMPLIANCE_SYSTEM = wrap(
 
 
 class Question(BaseModel):
+    model_config = ConfigDict(extra="forbid")
     key: str = Field(description="Machine key the user should answer for.")
     question: str = Field(description="The question to ask the user.")
-    required: bool = Field(default=True)
-    example: Optional[str] = Field(default=None)
-
-
-class IntakeBatchOut(BaseModel):
-    batch_name: str
-    questions: list[Question]
-    answer_format: str
-
-
-class IntakeExtractOut(BaseModel):
-    updates: dict[str, str] = Field(default_factory=dict)
-    blanks: list[str] = Field(default_factory=list)
-    what_i_understood: str = Field(default="")
-    still_missing: list[str] = Field(default_factory=list)
+    required: bool = Field(description="Whether this answer is required.")
+    example: str = Field(description="Example answer (empty string if none).")
 
 
 class PlanOut(BaseModel):
+    model_config = ConfigDict(extra="forbid")
     issues: list[str]
     outline: list[str]
-    critical_missing_facts: list[str] = Field(default_factory=list)
+    critical_missing_facts: list[str]
 
 
 class ResearchTask(BaseModel):
+    model_config = ConfigDict(extra="forbid")
     issue: str
     to_verify: list[str]
 
 
 class ResearchOut(BaseModel):
+    model_config = ConfigDict(extra="forbid")
     tasks: list[ResearchTask]
 
 
 class DraftOut(BaseModel):
+    model_config = ConfigDict(extra="forbid")
     draft_text: str
     one_page_brief: str
     blanks: list[str]
@@ -335,9 +312,10 @@ class DraftOut(BaseModel):
 
 
 class ComplianceOut(BaseModel):
+    model_config = ConfigDict(extra="forbid")
     ok: bool
-    missing_items: list[str] = Field(default_factory=list)
-    fix_questions: list[Question] = Field(default_factory=list)
+    missing_items: list[str]
+    fix_questions: list[Question]
 
 
 # -----------------------------
@@ -400,18 +378,6 @@ PLAIN_REQUIRED_FIELDS: list[tuple[str, str]] = [
 ]
 
 
-INTAKE_BATCHES: list[tuple[str, list[str]]] = [
-    ("Court + Parties", ["court_name", "plaintiff", "defendant", "plaintiff_address", "defendant_address"]),
-    ("Facts timeline", ["facts_timeline"]),
-    ("Cause of action", ["cause_of_action"]),
-    ("Jurisdiction", ["jurisdiction_facts"]),
-    ("Reliefs", ["reliefs"]),
-    ("Valuation + court fee", ["valuation", "court_fee"]),
-    ("Documents", ["documents"]),
-    ("Limitation", ["limitation"]),
-]
-
-
 def is_missing(case_file: dict[str, str], key: str) -> bool:
     value = (case_file.get(key) or "").strip()
     if not value:
@@ -434,12 +400,23 @@ def missing_required(case_file: dict[str, str]) -> list[str]:
     return missing
 
 
-def next_intake_batch(case_file: dict[str, str]) -> tuple[str, list[str]]:
-    for batch_name, keys in INTAKE_BATCHES:
-        missing_keys = [k for k in keys if is_missing(case_file, k)]
-        if missing_keys:
-            return batch_name, missing_keys
-    return "", []
+def next_missing_required_field(case_file: dict[str, str]) -> tuple[str, str] | None:
+    for key, desc in PLAIN_REQUIRED_FIELDS:
+        if is_missing(case_file, key):
+            return key, desc
+    return None
+
+
+def normalize_answer(text: str) -> str:
+    # Strip per-line whitespace and drop empty lines to reduce error-prone parsing.
+    lines = [line.strip() for line in str(text).splitlines()]
+    cleaned = "\n".join([ln for ln in lines if ln])
+    return cleaned.strip()
+
+
+def is_blank_answer(text: str) -> bool:
+    t = normalize_answer(text).strip().lower()
+    return t in {"", "[blank]", "blank", "unknown"}
 
 
 # -----------------------------
@@ -468,11 +445,13 @@ class LLMEngine:
 
             self._llm = ChatOpenAI(model=model, temperature=0)
 
-    def _cache_key(self, agent: str, system: str, user: str, schema_name: str) -> str:
+    def _cache_key(self, agent: str, system: str, user: str, schema_name: str, method: str) -> str:
         h = hashlib.sha256()
         h.update(agent.encode("utf-8"))
         h.update(b"\n---\n")
         h.update(self._model.encode("utf-8"))
+        h.update(b"\n---\n")
+        h.update(method.encode("utf-8"))
         h.update(b"\n---\n")
         h.update(schema_name.encode("utf-8"))
         h.update(b"\n---\n")
@@ -489,23 +468,49 @@ class LLMEngine:
         if self._mock:
             return self._mock_structured(agent=agent, user=user, schema=schema)
 
-        cache_key = self._cache_key(agent, system, user, schema.__name__)
-        ns = ("llm", agent)
-        if self._cache is not None:
-            hit = self._cache.get([(ns, cache_key)]).get((ns, cache_key))
-            if hit is not None:
-                return schema.model_validate(hit)
-
         if self._llm is None:
             raise RuntimeError("LLM is not initialized (mock mode should have returned earlier).")
 
-        structured = self._llm.with_structured_output(schema)  # type: ignore[attr-defined]
-        out = structured.invoke([SystemMessage(content=system), HumanMessage(content=user)])
+        ns = ("llm", agent)
 
-        if self._cache is not None:
-            self._cache.set({(ns, cache_key): (out.model_dump(), 24 * 3600)})
+        # Default to JSON Schema (strict). If the provider rejects the schema, fall back to function calling.
+        methods: list[str] = ["json_schema", "function_calling"]
 
-        return out
+        last_error: Exception | None = None
+        for method in methods:
+            cache_key = self._cache_key(agent, system, user, schema.__name__, method)
+            if self._cache is not None:
+                hit = self._cache.get([(ns, cache_key)]).get((ns, cache_key))
+                if hit is not None:
+                    return schema.model_validate(hit)
+
+            try:
+                kwargs: dict = {"method": method}
+                if method == "json_schema":
+                    kwargs["strict"] = True
+                structured = self._llm.with_structured_output(schema, **kwargs)  # type: ignore[attr-defined]
+                out = structured.invoke([SystemMessage(content=system), HumanMessage(content=user)])
+
+                if self._cache is not None:
+                    self._cache.set({(ns, cache_key): (out.model_dump(), 24 * 3600)})
+
+                return out
+            except Exception as e:  # pragma: no cover
+                last_error = e
+                msg = str(e)
+                # Only fall back when the issue is schema/method related.
+                if method == "json_schema" and (
+                    "Invalid schema for response_format" in msg
+                    or "response_format" in msg
+                    or "json_schema" in msg
+                    or "strict" in msg
+                ):
+                    continue
+                raise
+
+        if last_error is not None:
+            raise last_error
+        raise RuntimeError("Structured call failed without an exception (unexpected).")
 
     def _mock_structured(self, *, agent: str, user: str, schema: type[BaseModel]) -> BaseModel:
         """
@@ -513,65 +518,15 @@ class LLMEngine:
         This is intentionally basic; real behavior happens with the LLM.
         """
 
-        def parse_json_list(after_marker: str) -> list[str]:
-            if after_marker not in user:
-                return []
-            tail = user.split(after_marker, 1)[1]
-            # Grab first JSON list in the tail
-            start = tail.find("[")
-            end = tail.find("]")
-            if start == -1 or end == -1 or end < start:
-                return []
-            try:
-                return json.loads(tail[start : end + 1])
-            except Exception:
-                return []
-
-        def parse_user_answer() -> str:
-            if "User answer:" not in user:
-                return ""
-            return user.split("User answer:", 1)[1].strip()
-
-        if schema is IntakeBatchOut:
-            missing_desc = parse_json_list("Missing keys for this batch:")
-            questions: list[Question] = []
-            for item in missing_desc:
-                key = item.split(" — ", 1)[0].strip()
-                questions.append(Question(key=key, question=f"Provide {key}.", required=True, example=None))
-            return IntakeBatchOut(
-                batch_name="Mock intake batch",
-                questions=questions,
-                answer_format="Answer as key: value lines (end with blank line).",
-            )
-
-        if schema is IntakeExtractOut:
-            expected = parse_json_list("Expected keys (extract only these keys if present):")
-            answer_text = parse_user_answer()
-
-            updates: dict[str, str] = {}
-            blanks: list[str] = []
-
-            if len(expected) == 1:
-                # Freeform answer goes into the single expected key.
-                updates[expected[0]] = answer_text
-            else:
-                # Parse key:value lines, keep only expected keys.
-                for line in answer_text.splitlines():
-                    if ":" not in line:
-                        continue
-                    k, v = line.split(":", 1)
-                    k = k.strip()
-                    v = v.strip()
-                    if k in expected:
-                        updates[k] = v
-                        if v.lower() in {"blank", "unknown", "[blank]"}:
-                            blanks.append(k)
-
-            understood = "(mock) extracted: " + ", ".join(sorted(list(updates.keys())))
-            still_missing = [k for k in expected if k not in updates]
-            return IntakeExtractOut(
-                updates=updates, blanks=blanks, what_i_understood=understood, still_missing=still_missing
-            )
+        if schema is Question:
+            # The node decides which key is being requested; mock just mirrors it.
+            # The `key=...` line is typically present in the user prompt.
+            key = "unknown_key"
+            for line in user.splitlines():
+                if line.strip().startswith("key:"):
+                    key = line.split(":", 1)[1].strip()
+                    break
+            return Question(key=key, question=f"(mock) Provide {key}.", required=True, example="")
         if schema is PlanOut:
             return PlanOut(
                 issues=["Maintainability", "Jurisdiction", "Limitation", "Merits", "Reliefs"],
@@ -626,104 +581,101 @@ def node_intake(state: PlaintState, runtime: Runtime[Ctx]) -> PlaintState:
     case_file = dict(state.get("case_file", {}))
     blanks = list(state.get("blanks", []))
 
-    batch_name, missing_keys = next_intake_batch(case_file)
-    if not missing_keys:
-        return {"case_file": case_file, "blanks": blanks, "log": ["intake complete"]}
-
     if ENGINE is None:
         raise RuntimeError("LLM engine not initialized. Run() must set ENGINE before executing the graph.")
     llm = ENGINE
 
-    required_map = {k: desc for k, desc in PLAIN_REQUIRED_FIELDS}
-    missing_desc = [f"{k} — {required_map.get(k, '')}".strip() for k in missing_keys]
+    qa_entries: list[dict] = []
 
-    # 1) LLM asks the next batch questions (system prompt + user prompt).
-    questions_user_prompt = wrap(
-        f"""
-        We are drafting a CIVIL PLAINT in India.
+    # Ask one question at a time until minimum required fields are filled (or explicitly [BLANK_OK]).
+    while True:
+        next_item = next_missing_required_field(case_file)
+        if next_item is None:
+            break
 
-        Current case_file (JSON):
-        {json.dumps(case_file, indent=2)}
+        key, desc = next_item
 
-        Next intake batch: {batch_name}
-        Missing keys for this batch:
-        {json.dumps(missing_desc, indent=2)}
+        q_user_prompt = wrap(
+            f"""
+            We are drafting a CIVIL PLAINT in India.
 
-        Produce questions ONLY for these missing keys.
-        """
-    )
-    batch_out = llm.call_structured(
-        agent="intake_questioner",
-        system=INTAKE_QUESTIONER_SYSTEM,
-        user=questions_user_prompt,
-        schema=IntakeBatchOut,
-    )
+            key: {key}
+            key_description: {desc}
 
-    prompt = {
-        "title": f"Intake — {batch_out.batch_name}",
-        "category": CATEGORY,
-        "subcategory": SUBCATEGORY,
-        "type": DOC_TYPE,
-        "questions": [q.model_dump() for q in batch_out.questions],
-        "answer_format": batch_out.answer_format,
-        "note": "Answer in key:value lines. If unknown, write [BLANK]. End with an empty line.",
-    }
+            Current case_file (JSON):
+            {json.dumps(case_file, indent=2)}
 
-    answer = interrupt(prompt)
+            Create ONE focused intake question for this key only.
+            """
+        )
+        q = llm.call_structured(
+            agent="intake_questioner",
+            system=INTAKE_QUESTIONER_SYSTEM,
+            user=q_user_prompt,
+            schema=Question,
+        )
 
-    # 2) LLM extracts structured updates from the user's answer.
-    extract_user_prompt = wrap(
-        f"""
-        We are drafting a CIVIL PLAINT.
+        q_dict = q.model_dump()
+        # Guardrail: node decides which key is being collected.
+        q_dict["key"] = key
+        q_dict["required"] = True
 
-        Expected keys (extract only these keys if present):
-        {json.dumps(missing_keys, indent=2)}
+        prompt = {
+            "title": f"Intake — {key}",
+            "category": CATEGORY,
+            "subcategory": SUBCATEGORY,
+            "type": DOC_TYPE,
+            "questions": [q_dict],
+            "note": "Answer with plain text (multi-line allowed). If unknown, type [BLANK]. End with an empty line.",
+        }
 
-        Existing case_file (JSON):
-        {json.dumps(case_file, indent=2)}
+        answer = interrupt(prompt)
+        answer_text = normalize_answer(str(answer))
 
-        Return updates for the expected keys only.
+        if is_blank_answer(answer_text):
+            confirm = interrupt(
+                {
+                    "title": f"Confirm blank — {key}",
+                    "note": wrap(
+                        f"""
+                        You left `{key}` blank.
 
-        User answer:
-        {str(answer)}
-        """
-    )
-    extracted = llm.call_structured(
-        agent="intake_extractor",
-        system=INTAKE_EXTRACTOR_SYSTEM,
-        user=extract_user_prompt,
-        schema=IntakeExtractOut,
-    )
+                        Reply with:
+                          yes  -> proceed with a blank for now
+                          no   -> answer again
+                        """
+                    ),
+                }
+            )
+            if normalize_answer(str(confirm)).lower() not in {"y", "yes"}:
+                continue
+            case_file[key] = f"[BLANK_OK: {desc}]"
+            if key not in blanks:
+                blanks.append(key)
+        else:
+            case_file[key] = answer_text
 
-    # Merge updates
-    for k, v in extracted.updates.items():
-        if isinstance(v, str) and v.strip():
-            case_file[k] = v.strip()
-    for b in extracted.blanks:
-        if b not in blanks:
-            blanks.append(b)
+        # Persist case_file after every answer (durable).
+        runtime.store.put(("cases", runtime.context.case_id), "case_file", case_file)  # type: ignore[union-attr]
 
-    # Persist case_file after every batch (durable).
-    runtime.store.put(("cases", runtime.context.case_id), "case_file", case_file)  # type: ignore[union-attr]
-
-    qa_entry = {
-        "batch": batch_name,
-        "questions": [q.model_dump() for q in batch_out.questions],
-        "answer": str(answer),
-        "updates": extracted.updates,
-        "blanks": extracted.blanks,
-        "what_i_understood": extracted.what_i_understood,
-    }
+        qa_entries.append(
+            {
+                "key": key,
+                "question": q_dict.get("question"),
+                "answer_raw": str(answer),
+                "answer_stored": case_file.get(key, ""),
+            }
+        )
 
     return {
         "case_file": case_file,
         "blanks": blanks,
-        "qa_log": [qa_entry],
-        "log": [f"intake({batch_name}) updated_keys={list(extracted.updates.keys())}"],
+        "qa_log": qa_entries,
+        "log": ["intake complete"],
     }
 
 
-def node_minimum_gate(state: PlaintState) -> PlaintState:
+def node_minimum_gate(state: PlaintState, runtime: Runtime[Ctx]) -> PlaintState:
     case_file = dict(state.get("case_file", {}))
     blanks = list(state.get("blanks", []))
     missing = missing_required(case_file)
@@ -735,47 +687,32 @@ def node_minimum_gate(state: PlaintState) -> PlaintState:
     prompt = {
         "title": "Minimum Viable Case File (Gate)",
         "missing": missing,
-        "instructions": wrap(
+        "note": wrap(
             """
-            We are missing essential facts to draft a plaint.
+            Some required fields are still missing.
 
-            Reply with key:value lines to fill missing items (you can fill multiple at once).
-            If you truly don't know, write [BLANK] — but confirm you want to proceed with blanks by adding:
-              proceed_with_blanks: yes
+            Reply with:
+              yes  -> proceed with blanks (the system will mark missing fields as [BLANK_OK])
+              no   -> continue intake questions
             """
         ),
     }
 
     answer = interrupt(prompt)
-    text = str(answer).strip()
+    decision = normalize_answer(str(answer)).lower()
+    proceed = decision in {"y", "yes"}
 
-    # Simple parse: key: value lines.
-    updates: dict[str, str] = {}
-    proceed_with_blanks = False
-    for line in text.splitlines():
-        if ":" not in line:
-            continue
-        k, v = line.split(":", 1)
-        k = k.strip()
-        v = v.strip()
-        if k == "proceed_with_blanks" and v.lower() in {"y", "yes", "true"}:
-            proceed_with_blanks = True
-        else:
-            updates[k] = v
-
-    for k, v in updates.items():
-        case_file[k] = v
-
-    # If user confirmed proceed_with_blanks, fill remaining missing keys with [BLANK: ...]
-    if proceed_with_blanks:
+    if proceed:
         for entry in missing_required(case_file):
             key, desc = entry.split(" — ", 1)
             if is_missing(case_file, key):
                 case_file[key] = f"[BLANK_OK: {desc}]"
                 if key not in blanks:
                     blanks.append(key)
+        runtime.store.put(("cases", runtime.context.case_id), "case_file", case_file)  # type: ignore[union-attr]
+        return {"case_file": case_file, "blanks": blanks, "log": ["minimum gate: proceed with blanks"]}
 
-    return {"case_file": case_file, "blanks": blanks, "log": ["minimum gate: not OK -> user provided updates"]}
+    return {"log": ["minimum gate: user chose to continue intake"]}
 
 
 def route_after_minimum_gate(state: PlaintState) -> str:
@@ -904,25 +841,57 @@ def node_fix_missing(state: PlaintState, runtime: Runtime[Ctx]) -> PlaintState:
         # If the compliance agent did not give structured fix questions, fall back to gate.
         return {"log": ["compliance missing but no fix_questions -> return to intake"]}
 
-    prompt = {
-        "title": "Compliance fixes needed (answer to proceed)",
-        "questions": fix_qs,
-        "note": "Answer in key:value lines. End with an empty line.",
-    }
-    answer = interrupt(prompt)
-    text = str(answer).strip()
-
-    updates: dict[str, str] = {}
-    for line in text.splitlines():
-        if ":" not in line:
-            continue
-        k, v = line.split(":", 1)
-        updates[k.strip()] = v.strip()
-
     case_file = dict(state.get("case_file", {}))
-    case_file.update({k: v for k, v in updates.items() if v})
-    runtime.store.put(("cases", runtime.context.case_id), "case_file", case_file)  # type: ignore[union-attr]
-    return {"case_file": case_file, "log": ["applied compliance fixes -> redraft"]}
+    blanks = list(state.get("blanks", []))
+
+    for q in fix_qs:
+        key = (q.get("key") or "").strip()
+        question = (q.get("question") or "").strip()
+        if not key:
+            continue
+
+        while is_missing(case_file, key):
+            prompt = {
+                "title": f"Compliance fix — {key}",
+                "questions": [
+                    {
+                        "key": key,
+                        "question": question or f"Provide {key}.",
+                        "required": True,
+                        "example": q.get("example", "") or "",
+                    }
+                ],
+                "note": "Answer with plain text (multi-line allowed). If unknown, type [BLANK]. End with an empty line.",
+            }
+            answer = interrupt(prompt)
+            answer_text = normalize_answer(str(answer))
+
+            if is_blank_answer(answer_text):
+                confirm = interrupt(
+                    {
+                        "title": f"Confirm blank — {key}",
+                        "note": wrap(
+                            f"""
+                            You left `{key}` blank.
+
+                            Reply with:
+                              yes  -> proceed with a blank for now
+                              no   -> answer again
+                            """
+                        ),
+                    }
+                )
+                if normalize_answer(str(confirm)).lower() not in {"y", "yes"}:
+                    continue
+                case_file[key] = "[BLANK_OK: compliance fix]"
+                if key not in blanks:
+                    blanks.append(key)
+            else:
+                case_file[key] = answer_text
+
+            runtime.store.put(("cases", runtime.context.case_id), "case_file", case_file)  # type: ignore[union-attr]
+
+    return {"case_file": case_file, "blanks": blanks, "log": ["applied compliance fixes -> redraft"]}
 
 
 def route_after_fix_missing(_: PlaintState) -> str:
@@ -1008,39 +977,25 @@ builder.add_edge("deliver", END)
 
 
 DEMO_ANSWERS: list[str] = [
-    # Batch 1: court + parties
-    "\n".join([
-        "court_name: City Civil Court at Bengaluru",
-        "plaintiff: Mr. A, adult Indian citizen",
-        "defendant: M/s B Pvt Ltd, company incorporated under Companies Act",
-        "plaintiff_address: Bengaluru, Karnataka (service address)",
-        "defendant_address: Bengaluru, Karnataka (registered office/service)",
-    ]),
-    # Batch 2: facts
-    "\n".join([
-        "2024-01-10: Service contract executed at Bengaluru.",
-        "2024-02-05: Invoice raised for INR 5,00,000 payable within 15 days.",
-        "2024-03-01: Reminder issued; no payment received.",
-    ]),
-    # Batch 3: cause
+    "City Civil Court at Bengaluru",
+    "Mr. A, adult Indian citizen (plaintiff)",
+    "M/s B Pvt Ltd, company incorporated under Companies Act (defendant)",
+    "Bengaluru, Karnataka (service address of plaintiff)",
+    "Bengaluru, Karnataka (registered office/service address of defendant)",
+    "\n".join(
+        [
+            "2024-01-10: Service contract executed at Bengaluru.",
+            "2024-02-05: Invoice raised for INR 5,00,000 payable within 15 days.",
+            "2024-03-01: Reminder issued; no payment received.",
+        ]
+    ),
     "Defendant failed to pay the invoice amount despite contractual obligation and repeated demands.",
-    # Batch 4: jurisdiction
     "Cause of action arose in Bengaluru; contract executed/performed in Bengaluru; defendant carries on business in Bengaluru.",
-    # Batch 5: reliefs
-    "\n".join([
-        "Decree for INR 5,00,000 with interest.",
-        "Costs of the suit.",
-        "Any other relief deemed fit.",
-    ]),
-    # Batch 6: valuation + court fee
-    "\n".join([
-        "valuation: INR 5,00,000",
-        "court_fee: TO BE COMPUTED AS PER APPLICABLE COURT FEE ACT (BLANK)",
-    ]),
-    # Batch 7: documents
-    "\n".join(["Service contract dated 2024-01-10", "Invoice dated 2024-02-05", "Reminder email dated 2024-03-01"]),
-    # Batch 8: limitation
+    "\n".join(["Decree for INR 5,00,000 with interest.", "Costs of the suit.", "Any other relief deemed fit."]),
+    "INR 5,00,000",
+    "TO BE COMPUTED AS PER APPLICABLE COURT FEE ACT [BLANK]",
     "Within limitation as cause of action arose in 2024.",
+    "\n".join(["Service contract dated 2024-01-10", "Invoice dated 2024-02-05", "Reminder email dated 2024-03-01"]),
 ]
 
 
@@ -1132,9 +1087,9 @@ def run(*, demo: bool, mock: bool, thread_id: str | None, case_id: str | None, r
                         if demo:
                             if isinstance(prompt, dict) and prompt.get("missing"):
                                 # Minimum gate: allow continuing with blanks so the demo completes.
-                                answer = "proceed_with_blanks: yes"
+                                answer = "yes"
                             elif not demo_answers:
-                                answer = "proceed_with_blanks: yes"
+                                answer = "yes"
                             else:
                                 answer = demo_answers.pop(0)
                             step("Demo answer used")
